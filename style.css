@@ -1,0 +1,228 @@
+/* ── Reset ─────────────────────────────────────────────────────────────────── */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+/* ── Full-viewport body ────────────────────────────────────────────────────── */
+/* overflow:hidden prevents rubber-band scrolling on iOS that would expose the
+   background colour behind the canvas during a swipe gesture.                 */
+body {
+    background: #1a1a2e;
+    /* matches BACKGROUND_GRADIENT.START in config.js so
+                              there is no flash of wrong colour during load       */
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100vw;
+    height: 100vh;
+}
+
+/* ── Canvas ────────────────────────────────────────────────────────────────── */
+/* touch-action:none lets LittleJS handle all pointer events itself without the
+   browser intercepting panning / pinch-zoom gestures.                          */
+canvas {
+    display: block;
+    touch-action: none;
+}
+
+#turn {
+    width: 100%;
+    height: 100%;
+    position: fixed;
+    top: 0px;
+    left: 0px;
+    background-color: black;
+    background-image: url('orientation.jpg');
+    background-repeat: no-repeat;
+    background-position: center center;
+    display: none;
+}
+
+/* ── Config Overlay ────────────────────────────────────────────────────────── */
+.config-overlay {
+    position: fixed;
+    top: 5vmin;
+    left: 5vmin;
+    right: 5vmin;
+    bottom: 5vmin;
+    background: rgba(45, 45, 68, 0.95);
+    border-radius: 12px;
+    z-index: 1000;
+    display: flex;
+    flex-direction: column;
+    color: #fff;
+    font-family: Arial, sans-serif;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8);
+    overflow: hidden;
+}
+
+@media (max-width: 768px) {
+    .config-overlay {
+        top: 2vmin;
+        left: 2vmin;
+        right: 2vmin;
+        bottom: 2vmin;
+        border-radius: 8px;
+    }
+}
+
+.config-overlay.hidden {
+    display: none !important;
+}
+
+.config-content {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    padding: 10px;
+}
+
+.config-content h2 {
+    font-size: 20px;
+}
+
+.config-form {
+    flex: 1;
+    overflow-y: auto;
+    padding-right: 5px;
+    touch-action: pan-y;
+    -webkit-overflow-scrolling: touch;
+}
+
+.config-form::-webkit-scrollbar {
+    width: 6px;
+}
+
+.config-form::-webkit-scrollbar-track {
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 3px;
+}
+
+.config-form::-webkit-scrollbar-thumb {
+    background: #70A1FF;
+    border-radius: 3px;
+}
+
+.config-section {
+    margin-bottom: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.2);
+}
+
+.config-section summary {
+    padding: 8px;
+    font-weight: bold;
+    cursor: pointer;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 6px;
+    user-select: none;
+    font-size: 14px;
+    text-transform: capitalize;
+}
+
+.config-section-content {
+    padding: 10px;
+}
+
+@media (max-width: 768px) {
+    .config-section-content {
+        padding: 6px;
+    }
+}
+
+.config-group {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 8px;
+    gap: 8px;
+}
+
+.config-group label {
+    flex: 1;
+    font-size: 12px;
+    color: #CCC;
+    word-break: break-all;
+    padding-top: 4px;
+}
+
+.config-group input[type="text"],
+.config-group input[type="number"],
+.config-group textarea {
+    flex: 2;
+    background: #1a1a2e;
+    border: 1px solid #70A1FF;
+    color: #FFF;
+    padding: 6px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    resize: vertical;
+}
+
+.config-group input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+    align-self: center;
+}
+
+.btn-export {
+    background: #3498db;
+}
+
+.btn-import {
+    background: #9b59b6;
+}
+
+.config-actions {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.config-actions-left,
+.config-actions-right {
+    display: flex;
+    gap: 10px;
+}
+
+.config-actions button {
+    padding: 8px 12px;
+    font-size: 14px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-weight: bold;
+    color: white;
+}
+
+@media (max-width: 768px) {
+    .config-actions button {
+        padding: 6px 10px;
+        font-size: 12px;
+    }
+}
+
+.btn-default {
+    background: #FFA502;
+}
+
+.btn-cancel {
+    background: #FF6B6B;
+}
+
+.btn-apply {
+    background: #7BED9F;
+    color: #1a1a2e;
+}
+
+.config-actions button:active {
+    opacity: 0.8;
+    transform: scale(0.95);
+}

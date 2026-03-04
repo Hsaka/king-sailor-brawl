@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <!-- Prevents mobile browsers from zooming / scaling the page themselves.
+         maximum-scale=1.0 and user-scalable=no are critical — without them iOS
+         will auto-zoom on input focus and break the canvas coordinate mapping. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>King Sailor Brawl</title>
+    <!-- Preconnect for Google Fonts if you want to use a web font -->
+    <!-- <link rel="preconnect" href="https://fonts.googleapis.com"> -->
+    <link rel="stylesheet" href="style.css">
+    <!-- PeerJS CDN for WebRTC P2P networking -->
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+</head>
+
+<body>
+    <!-- LittleJS appends its canvas directly to document.body.
+         No wrapper div needed — the CSS handles full-viewport centering. -->
+
+    <script type="module" src="App.js"></script>
+</body>
+
+</html>
