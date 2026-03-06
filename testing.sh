@@ -27,8 +27,13 @@ echo "🌍 Starting noVNC on port 6080..."
 websockify --web /usr/share/novnc/ 6080 localhost:5900 &
 sleep 2
 
+echo "🚀 Serving web app..."
+cd /workspaces/$(ls /workspaces | head -1)
+python3 -m http.server 8080 &
+sleep 2
+
 echo "🚀 Launching browser..."
-DISPLAY=:1 $BROWSER &
+DISPLAY=:1 $BROWSER http://localhost:8080 &
 
 echo ""
 echo "✅ Done! Next steps:"
