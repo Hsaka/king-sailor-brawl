@@ -497,7 +497,10 @@ export class Session {
     }
 
     handleSyncMessage(message) {
-        this.engine.setState(message.tick, message.state, message.playerTimeline);
+        // Use the non-destructive applyAuthoritativeSync instead of setState,
+        // which preserves our local inputs and fast-forwards the simulation back
+        // to the present frame, avoiding a massive visual jerk.
+        this.engine.applyAuthoritativeSync(message.tick, message.state, message.playerTimeline);
         this.pendingHashMessages = [];
 
         for (const entry of message.playerTimeline) {

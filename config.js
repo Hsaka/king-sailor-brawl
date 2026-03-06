@@ -123,10 +123,12 @@ export const CONFIG = {
     NETCODE: {
         TICK_RATE: 60,
         SNAPSHOT_HISTORY: 120,
-        // Keep speculation low — less rollback magnitude means smaller position corrections.
-        // 20 ticks = ~333ms lag tolerance before the engine stalls instead of building up
-        // a large speculative gap that snaps visually when corrected.
-        MAX_SPECULATION_TICKS: 20,
+        // Allow deep speculation (60 ticks = 1s lag tolerance).
+        // Stalling the engine makes the local player jerky. Since we now
+        // have adaptive render smoothing (disp.x/disp.y), large rollbacks
+        // are visually absorbed, so we can afford high speculation to keep
+        // local simulation fluid.
+        MAX_SPECULATION_TICKS: 60,
         // Low hash interval = fast desync detection. At 60fps, 10 ticks = ~167ms between
         // hash comparisons. Previous value of 60 meant desync detection took up to 1 second.
         HASH_INTERVAL: 10,

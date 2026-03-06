@@ -302,6 +302,52 @@ export class RollbackEngine {
         this._confirmedTick = asTick(tick - 1);
     }
 
+    applyAuthoritativeSync(tick, state, playerTimeline) {
+        // Update player timeline safely without wiping buffers
+        for (const entry of playerTimeline) {
+            const existing = this.inputBuffer.players.get(entry.playerId);
+            if (!existing) {
+                this.inputBuffer.addPlayer(entry.playerId, entry.joinTick);
+            } else if (existing.leaveTick === null && entry.leaveTick !== null) {
+                this.inputBuffer.removePlayer(entry.playerId, entry.leaveTick);
+            }
+        }
+
+        this.inputBuffer.setConfirmedTickForSync(tick);
+
+        if (this._currentTick <= tick) {
+            // Initial join or jumping forward. We don't have local inputs yet.
+            this.gameDeserialize(tick, state);
+            const hash = this.gameHash(tick);
+            this.snapshotBuffer.save(tick, state, hash);
+            this._currentTick = asTick(tick + 1);
+            this._confirmedTick = tick;
+            return;
+        }
+
+        // Mid-game resync (we are ahead of the sync tick).
+        // Overwrite the snapshot at 'tick' with the host's authoritative state.
+        this.gameDeserialize(tick, state);
+        const hash = this.gameHash(tick);
+        this.snapshotBuffer.save(tick, state, hash);
+
+        // Now resimulate from tick+1 up to currentTick, using our PRESERVED localInputs!
+        const resimulateFromTick = asTick(tick + 1);
+        this.inputBuffer.clearAllUsedInputsFrom(resimulateFromTick);
+
+        for (let t = resimulateFromTick; t < this._currentTick; t++) {
+            const tickAsTick = asTick(t);
+            this.handlePlayerLifecycleAtTick(tickAsTick);
+
+            const inputs = this.gatherInputs(tickAsTick);
+            this.gameStep(tickAsTick, inputs);
+
+            const s = this.gameSerialize(tickAsTick);
+            const h = this.gameHash(tickAsTick);
+            this.snapshotBuffer.save(tickAsTick, s, h);
+        }
+    }
+
     resetForSync(tick, playerTimeline) {
         this.snapshotBuffer.clear();
         this.inputBuffer.clear();
