@@ -2,7 +2,8 @@
 set -e
 
 echo "📦 Installing dependencies..."
-sudo apt update -qq
+sudo rm -f /etc/apt/sources.list.d/yarn.list
+sudo apt update -qq 2>&1 | grep -v "^W:" || true
 sudo apt install -y xfce4 xfce4-goodies x11vnc xvfb novnc websockify dbus-x11 xfonts-base
 
 echo "🌐 Installing browser..."
