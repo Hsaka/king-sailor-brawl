@@ -67,6 +67,31 @@ export class RollbackEngine {
         }
     }
 
+    crystallizePlayerInputs(playerId, upToTick) {
+        const player = this.inputBuffer.players.get(playerId);
+        if (!player) return;
+
+        let modified = false;
+        for (let t = player.confirmedTick + 1; t <= upToTick; t++) {
+            const tick = asTick(t);
+            if (!player.received.has(tick)) {
+                let used = player.usedInputs.get(tick);
+                if (!used) {
+                    const lastMsg = this.inputBuffer.getLastConfirmedInput(playerId);
+                    used = this.inputPredictor.predict(playerId, tick, lastMsg);
+                }
+                const copy = new Uint8Array(used.length);
+                copy.set(used);
+                player.received.set(tick, copy);
+                modified = true;
+            }
+        }
+
+        if (modified) {
+            this.inputBuffer.updateConfirmedTick(player);
+        }
+    }
+
     tick() {
         if (this._currentTick === 0) {
             this.saveInitialSnapshot();

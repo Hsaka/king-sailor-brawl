@@ -133,7 +133,7 @@ export const CONFIG = {
         // Higher redundancy = inputs survive more packet drops without misprediction.
         INPUT_REDUNDANCY: 5,
         DISCONNECT_TIMEOUT: 5000,
-        SMOOTH_SYNC_MODE: false
+        SMOOTH_SYNC_MODE: true
     },
 
     MOBILE: {
