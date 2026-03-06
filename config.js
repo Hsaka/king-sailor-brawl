@@ -123,10 +123,17 @@ export const CONFIG = {
     NETCODE: {
         TICK_RATE: 60,
         SNAPSHOT_HISTORY: 120,
-        MAX_SPECULATION_TICKS: 60,
-        HASH_INTERVAL: 60,
-        INPUT_REDUNDANCY: 3,
+        // Keep speculation low — less rollback magnitude means smaller position corrections.
+        // 20 ticks = ~333ms lag tolerance before the engine stalls instead of building up
+        // a large speculative gap that snaps visually when corrected.
+        MAX_SPECULATION_TICKS: 20,
+        // Low hash interval = fast desync detection. At 60fps, 10 ticks = ~167ms between
+        // hash comparisons. Previous value of 60 meant desync detection took up to 1 second.
+        HASH_INTERVAL: 10,
+        // Higher redundancy = inputs survive more packet drops without misprediction.
+        INPUT_REDUNDANCY: 5,
         DISCONNECT_TIMEOUT: 5000,
+        SMOOTH_SYNC_MODE: false
     },
 
     MOBILE: {

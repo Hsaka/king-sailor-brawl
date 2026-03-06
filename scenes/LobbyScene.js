@@ -73,7 +73,21 @@ export class LobbyScene {
                 this.transport.setPeerInstance(this.peer);
                 this.setupTransportListeners();
 
-                this.session = createSession({ game: this.worldState, transport: this.transport, config: { debug: false, localPlayerName: playerName } });
+                this.session = createSession({
+                    game: this.worldState,
+                    transport: this.transport,
+                    config: {
+                        debug: false,
+                        localPlayerName: playerName,
+                        tickRate: CONFIG.NETCODE.TICK_RATE,
+                        snapshotHistorySize: CONFIG.NETCODE.SNAPSHOT_HISTORY,
+                        maxSpeculationTicks: CONFIG.NETCODE.MAX_SPECULATION_TICKS,
+                        hashInterval: CONFIG.NETCODE.HASH_INTERVAL,
+                        inputRedundancy: CONFIG.NETCODE.INPUT_REDUNDANCY,
+                        disconnectTimeout: CONFIG.NETCODE.DISCONNECT_TIMEOUT,
+                        smoothSyncMode: CONFIG.NETCODE.SMOOTH_SYNC_MODE,
+                    },
+                });
                 this.setupSessionListeners();
 
                 this.session.createRoom().then(() => {
@@ -115,7 +129,21 @@ export class LobbyScene {
                 this.transport.setPeerInstance(this.peer);
                 this.setupTransportListeners();
 
-                this.session = createSession({ game: this.worldState, transport: this.transport, config: { debug: false, localPlayerName: playerName } });
+                this.session = createSession({
+                    game: this.worldState,
+                    transport: this.transport,
+                    config: {
+                        debug: false,
+                        localPlayerName: playerName,
+                        tickRate: CONFIG.NETCODE.TICK_RATE,
+                        snapshotHistorySize: CONFIG.NETCODE.SNAPSHOT_HISTORY,
+                        maxSpeculationTicks: CONFIG.NETCODE.MAX_SPECULATION_TICKS,
+                        hashInterval: CONFIG.NETCODE.HASH_INTERVAL,
+                        inputRedundancy: CONFIG.NETCODE.INPUT_REDUNDANCY,
+                        disconnectTimeout: CONFIG.NETCODE.DISCONNECT_TIMEOUT,
+                        smoothSyncMode: CONFIG.NETCODE.SMOOTH_SYNC_MODE,
+                    },
+                });
                 this.setupSessionListeners();
 
                 this.connectionStatus = 'Connecting to host...';

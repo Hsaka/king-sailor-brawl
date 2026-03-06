@@ -23,6 +23,7 @@ export const DEFAULT_SESSION_CONFIG = {
     inputRedundancy: 3,
     joinRateLimitRequests: 3,
     joinRateLimitWindowMs: 10000,
+    smoothSyncMode: false,
 };
 
 export function asTick(n) {

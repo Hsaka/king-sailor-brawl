@@ -101,6 +101,7 @@ export class Session {
         this._isHost = false;
         this._roomId = null;
         this._localRole = PlayerRole.Player;
+        this._stallFrames = 0; // consecutive frames where engine.tick() did not advance
 
         this.rateLimitCleanupTimer = setInterval(() => {
             this.cleanupRateLimits();
@@ -137,6 +138,15 @@ export class Session {
 
     get confirmedTick() {
         return this.engine.confirmedTick;
+    }
+
+    /**
+     * Returns the highest tick for which we have received a real (non-predicted)
+     * input from the given player. If currentTick - result > 0, inputs are being
+     * predicted and the player may be lagging.
+     */
+    getConfirmedTickForPlayer(playerId) {
+        return this.engine.getConfirmedTickForPlayer(playerId);
     }
 
     destroy() {
@@ -279,16 +289,33 @@ export class Session {
             return { tick: this.engine.currentTick, rolledBack: false };
         }
 
-        const currentTick = this.engine.currentTick;
+        const tickBefore = this.engine.currentTick;
 
         if (this._localRole === PlayerRole.Player) {
             if (!localInput) throw new Error('Players must provide input');
 
-            this.engine.setLocalInput(currentTick, localInput);
-            this.broadcastInput(currentTick, localInput);
+            this.engine.setLocalInput(tickBefore, localInput);
+            this.broadcastInput(tickBefore, localInput);
         }
 
         const result = this.engine.tick();
+
+        if (this.config.smoothSyncMode) {
+            // Stall detection: if the engine didn't advance, the peer is waiting for
+            // remote inputs that haven't arrived (lag/desync). Track consecutive stall
+            // frames and proactively request a sync after 30 frames (~500ms) instead
+            // of waiting for a hash comparison that can only fire when confirmed ticks
+            // advance — which can't happen while the engine is stalled.
+            if (this.engine.currentTick === tickBefore) {
+                this._stallFrames++;
+                // Request sync every 90 frames while stalled to avoid spamming.
+                if (!this._isHost && this._stallFrames > 0 && this._stallFrames % 90 === 30) {
+                    this.requestSync();
+                }
+            } else {
+                this._stallFrames = 0;
+            }
+        }
 
         if (result.error) {
             this.emit('error', result.error, { source: ErrorSource.Engine, recoverable: true, details: { tick: result.tick } });
@@ -513,9 +540,31 @@ export class Session {
             if (p) pt.name = p.name;
         }
         const syncMsg = createSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline);
-        this.broadcast(syncMsg, true);
-        this.engine.resetForSync(state.tick, state.playerTimeline);
-        this.pendingHashMessages = [];
+
+        if (this.config.smoothSyncMode) {
+            // Send sync ONLY to the requesting peer — do NOT broadcast to everyone.
+            // Broadcasting would force a full state reset on all connected clients,
+            // causing everyone to teleport just because one peer desynced.
+            const requestingPeerId = playerIdToPeerId(message.playerId);
+            this.transport.send(requestingPeerId, encodeMessage(syncMsg), true);
+
+            // Crystallise the desynced player's inputs up to the snapshot tick
+            // so that their confirmedTick stops being stuck due to missing inputs
+            // during the stall/sync period. This ensures the host can process
+            // their new inputs normally instead of ignoring them forever.
+            this.engine.crystallizePlayerInputs(message.playerId, asTick(state.tick - 1));
+
+            // Do NOT call resetForSync here: that wipes the host's snapshot buffer,
+            // preventing future rollbacks for all other players.
+            // The desynced peer will re-initialise from the received StateSync.
+            this.pendingHashMessages = this.pendingHashMessages.filter(
+                h => h.playerId !== message.playerId
+            );
+        } else {
+            this.broadcast(syncMsg, true);
+            this.engine.resetForSync(state.tick, state.playerTimeline);
+            this.pendingHashMessages = [];
+        }
     }
 
     handleJoinRequest(peerId, message) {

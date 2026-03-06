@@ -34,6 +34,12 @@ export class GameScene {
         this.gameOverTimer = -1;
         this.spectateId = null;
 
+        // Render-side interpolation: display positions ease toward simulation positions.
+        // This absorbs rollback correction snaps so ships don't visually teleport.
+        // Key: playerId, Value: { x, y, heading }
+        // Adaptive lerp factors are applied per-player based on lag state (see onRender).
+        this._displayState = new Map();
+
         // Wheel control scheme
         this.wheelControl = CONFIG.MOVEMENT.WHEEL_CONTROL_SCHEME ? new WheelControl() : null;
 
@@ -362,18 +368,128 @@ export class GameScene {
         c.fillRect(0, 0, Math.max(0, mx + this.map.deathZoneDepth * s), sh);
         c.fillRect(Math.min(sw, mx + mw - this.map.deathZoneDepth * s), 0, sw, sh);
 
-        // Render Ships
+        // Render Ships — using adaptive lerp to smooth rollback corrections.
+        //
+        // Strategy:
+        //   LOCAL player        → lerp 1.0 (instant: no rollback on own inputs)
+        //   REMOTE confirmed    → lerp 0.3  (light smoothing for minor corrections)
+        //   REMOTE lagging      → lerp 0.03 (near-freeze: don't chase the speculative
+        //                                     simulation which is rolling back every tick)
+        //
+        // When a lagging peer's inputs finally arrive and the simulation corrects,
+        // the display state smoothly eases to the corrected position rather than snapping.
+        const LAG_FREEZE_THRESHOLD = 3; // ticks behind before we consider inputs "predicted"
+        const LERP_LOCAL = 1.0;
+        const LERP_CONFIRMED = 0.3;
+        const LERP_LAGGING = 0.03;
+
+        const currentTick = this.session?.currentTick ?? 0;
+        const localId = this.worldState.localPlayerId;
+
         for (const [id, pdata] of this.worldState.players) {
-            // Reconstruct a temporary ship class for rendering if it doesn't exist, else use WorldState instance
+
+            var renderData = pdata;
+
+            if (CONFIG.NETCODE.SMOOTH_SYNC_MODE) {
+                // Determine the adaptive lerp factor for this player.
+                let lerpFactor;
+                if (id === localId) {
+                    // Local player: always show exact simulation position.
+                    // We never roll back our own inputs, so no snapping occurs.
+                    lerpFactor = LERP_LOCAL;
+                } else {
+                    const confirmedTick = this.session?.getConfirmedTickForPlayer(id);
+                    const ticksBehind = confirmedTick !== undefined
+                        ? Math.max(0, currentTick - confirmedTick - 1)
+                        : 0;
+                    // ticksBehind > LAG_FREEZE_THRESHOLD means we're predicting inputs.
+                    // The speculative simulation is unreliable: freeze the display position
+                    // so the lagging ship glides on its last known trajectory instead of
+                    // bouncing with every rollback correction.
+                    lerpFactor = ticksBehind > LAG_FREEZE_THRESHOLD ? LERP_LAGGING : LERP_CONFIRMED;
+                }
+
+                // Get or create display state for this player.
+                let disp = this._displayState.get(id);
+                if (!disp) {
+                    // First frame for this player: snap to exact simulation position.
+                    // vx/vy: smoothed velocity vector used for heading derivation during lag.
+                    disp = { x: pdata.x, y: pdata.y, heading: pdata.heading, vx: 0, vy: 0 };
+                    this._displayState.set(id, disp);
+                } else {
+                    const prevX = disp.x;
+                    const prevY = disp.y;
+
+                    // Ease display position toward the simulation position.
+                    disp.x += (pdata.x - disp.x) * lerpFactor;
+                    disp.y += (pdata.y - disp.y) * lerpFactor;
+
+                    if (lerpFactor === LERP_LAGGING) {
+                        // Lagging player: derive heading from a SMOOTHED velocity vector.
+                        //
+                        // Problem with raw delta atan2: at LERP_LAGGING=0.03 the position
+                        // moves only a fraction of a pixel per frame. atan2 on sub-pixel
+                        // deltas is extremely noise-sensitive — tiny drift fluctuations
+                        // produce large angle swings, causing visible heading jerk.
+                        //
+                        // Fix: maintain a low-pass filtered velocity (vx, vy) in displayState
+                        // using VEL_SMOOTH=0.08 (~12-frame averaging window). Heading is
+                        // derived from this smoothed signal, which is stable.
+                        const VEL_SMOOTH = 0.08;
+                        const rawDx = disp.x - prevX;
+                        const rawDy = disp.y - prevY;
+                        disp.vx += (rawDx - disp.vx) * VEL_SMOOTH;
+                        disp.vy += (rawDy - disp.vy) * VEL_SMOOTH;
+
+                        const velMag = Math.hypot(disp.vx, disp.vy);
+                        // Only steer if the smoothed velocity is meaningful.
+                        if (velMag > 0.005) {
+                            let movHeading = Math.atan2(disp.vy, disp.vx) * 180 / Math.PI;
+                            if (movHeading < 0) movHeading += 360;
+
+                            // Ease toward that angle with shortest-arc wrapping.
+                            let hDiff = movHeading - disp.heading;
+                            if (hDiff > 180) hDiff -= 360;
+                            if (hDiff < -180) hDiff += 360;
+                            disp.heading += hDiff * 0.08;
+                            if (disp.heading < 0) disp.heading += 360;
+                            if (disp.heading >= 360) disp.heading -= 360;
+                        }
+                    } else {
+                        // Confirmed inputs: ease toward the real simulation heading (0.15 ≈ 6-7 frames).
+                        let hDiff = pdata.heading - disp.heading;
+                        if (hDiff > 180) hDiff -= 360;
+                        if (hDiff < -180) hDiff += 360;
+                        const hLerpFactor = id === localId ? LERP_LOCAL : 0.15;
+                        disp.heading += hDiff * hLerpFactor;
+                        if (disp.heading < 0) disp.heading += 360;
+                        if (disp.heading >= 360) disp.heading -= 360;
+                    }
+                }
+
+                // Build a render-only copy at the display position — simulation state unchanged.
+                renderData = { ...pdata, x: disp.x, y: disp.y, heading: disp.heading };
+            }
+
+
             let ship = this.worldState.shipInstances.get(id);
             if (!ship) {
-                ship = new Ship(id, pdata); // Fallback
+                ship = new Ship(id, renderData);
             } else {
-                ship.loadState(pdata);
+                ship.loadState(renderData);
             }
             const sessionPlayer = this.session?.playerManager.get(id);
             const playerName = sessionPlayer ? sessionPlayer.name : null;
             ship.render(c, s, renderOffsetX, renderOffsetY, 1.0, playerName);
+        }
+
+        if (CONFIG.NETCODE.SMOOTH_SYNC_MODE) {
+            // Clean up display state for players who have left.
+            for (const id of this._displayState.keys()) {
+                if (!this.worldState.players.has(id)) {
+                    this._displayState.delete(id);
+                }
+            }
         }
 
         // Render Debris
