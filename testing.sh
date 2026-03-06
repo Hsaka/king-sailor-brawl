@@ -7,20 +7,8 @@ sudo apt update -qq 2>&1 | grep -v "^W:" || true
 sudo apt install -y xfce4 xfce4-goodies x11vnc xvfb novnc websockify dbus-x11 xfonts-base
 
 echo "🌐 Installing browser..."
-if sudo apt install -y chromium 2>/dev/null; then
-    BROWSER="chromium --no-sandbox"
-elif sudo apt install -y chromium-browser 2>/dev/null; then
-    BROWSER="chromium-browser --no-sandbox"
-elif sudo snap install firefox 2>/dev/null; then
-    BROWSER="firefox"
-elif sudo apt install -y firefox 2>/dev/null; then
-    BROWSER="firefox"
-else
-    sudo add-apt-repository ppa:mozillateam/ppa -y
-    sudo apt update -qq
-    sudo apt install -y firefox-esr
-    BROWSER="firefox"
-fi
+sudo apt install -y firefox-esr 2>/dev/null || true
+BROWSER="firefox-esr"
 
 echo "🖥️  Starting virtual display..."
 pkill Xvfb 2>/dev/null || true
