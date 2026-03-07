@@ -51,6 +51,7 @@ export class Session {
         this.lastHashBroadcastTick = asTick(-1);
         this.inputRedundancy = this.config.inputRedundancy;
 
+
         this.engine = new RollbackEngine({
             game: this.game,
             localPlayerId: this._localPlayerId,

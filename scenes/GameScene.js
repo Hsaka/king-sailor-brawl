@@ -29,6 +29,12 @@ export class GameScene {
         this.camY = 0;
         this._proceduralClouds = null;
 
+        // Smoothed display position for the local player.
+        // Lerps toward the simulation position every frame so rollback-induced
+        // position corrections are absorbed gradually rather than snapping.
+        this._displayX = null;
+        this._displayY = null;
+
         this.minimap = new Minimap();
         this.hud = new HUD();
         this.gameOverTimer = -1;
@@ -122,6 +128,9 @@ export class GameScene {
         if (local) {
             this.camX = local.x;
             this.camY = local.y;
+            // Seed display pos so there is no initial lerp-in from (0,0)
+            this._displayX = local.x;
+            this._displayY = local.y;
             // Initialise wheel heading to the ship's current heading
             if (this.wheelControl) {
                 this.wheelControl.targetHeading = local.heading;
@@ -208,7 +217,29 @@ export class GameScene {
         if (!this.session) return;
 
         const input = this.updateLocalInput();
-        this.session.tick(input);
+        const tickResult = this.session.tick(input);
+
+        // Update smoothed display position for the local player.
+        // Use a fast lerp (0.35) so the ship feels responsive, but rollback
+        // corrections (which are typically small, 1–3 design-px) are damped
+        // rather than snapping. Only applied when actually rolling back so
+        // normal play has zero added latency.
+        const localSim = this.worldState.players.get(this.worldState.localPlayerId);
+        if (localSim) {
+            if (this._displayX === null) {
+                this._displayX = localSim.x;
+                this._displayY = localSim.y;
+            } else if (tickResult.rolledBack) {
+                // Rollback happened this frame: lerp slowly to absorb the correction
+                const lerpFactor = 0.35;
+                this._displayX += (localSim.x - this._displayX) * lerpFactor;
+                this._displayY += (localSim.y - this._displayY) * lerpFactor;
+            } else {
+                // No rollback: snap immediately so movement feels 1:1
+                this._displayX = localSim.x;
+                this._displayY = localSim.y;
+            }
+        }
 
         // Update camera targeting smoothly
         let focusId = this.worldState.localPlayerId;
@@ -242,8 +273,13 @@ export class GameScene {
         const focusPlayer = this.worldState.players.get(focusId);
         this.focusId = focusId;
         if (focusPlayer) {
-            this.camX += (focusPlayer.x - this.camX) * 0.1;
-            this.camY += (focusPlayer.y - this.camY) * 0.1;
+            // Use the smoothed display position for the local player so that
+            // rollback corrections don't jolt the camera.
+            const isLocalFocus = (focusId === this.worldState.localPlayerId);
+            const camTargetX = (isLocalFocus && this._displayX !== null) ? this._displayX : focusPlayer.x;
+            const camTargetY = (isLocalFocus && this._displayY !== null) ? this._displayY : focusPlayer.y;
+            this.camX += (camTargetX - this.camX) * 0.1;
+            this.camY += (camTargetY - this.camY) * 0.1;
 
             // Camera bounds
             const padding = this.map.deathZoneDepth;
@@ -364,13 +400,20 @@ export class GameScene {
 
         // Render Ships
         for (const [id, pdata] of this.worldState.players) {
-            // Reconstruct a temporary ship class for rendering if it doesn't exist, else use WorldState instance
             let ship = this.worldState.shipInstances.get(id);
             if (!ship) {
                 ship = new Ship(id, pdata); // Fallback
             } else {
                 ship.loadState(pdata);
             }
+
+            // For the local player on rollback frames, substitute the smoothed
+            // display position so the sprite doesn't snap to the corrected location.
+            if (id === this.worldState.localPlayerId && this._displayX !== null) {
+                ship.x = this._displayX;
+                ship.y = this._displayY;
+            }
+
             const sessionPlayer = this.session?.playerManager.get(id);
             const playerName = sessionPlayer ? sessionPlayer.name : null;
             ship.render(c, s, renderOffsetX, renderOffsetY, 1.0, playerName);
