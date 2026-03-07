@@ -21,6 +21,7 @@ export const DEFAULT_SESSION_CONFIG = {
     desyncAuthority: DesyncAuthority.Peer,
     lagReportThreshold: 30,
     inputRedundancy: 10,
+    inputDelay: 0,
     joinRateLimitRequests: 3,
     joinRateLimitWindowMs: 10000,
 };

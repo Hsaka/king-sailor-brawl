@@ -50,8 +50,11 @@ export class Session {
         this.lagReports = new Map();
         this.lastHashBroadcastTick = asTick(-1);
         this.inputRedundancy = this.config.inputRedundancy;
-
-
+        this.inputDelay = this.config.inputDelay ?? 0;
+        // frameCount is a monotonically-increasing counter of how many tick()
+        // calls have been made. It is used as the "submit tick" for local input,
+        // which is always ahead of the engine's current simulation tick by inputDelay.
+        this.frameCount = 0;
         this.engine = new RollbackEngine({
             game: this.game,
             localPlayerId: this._localPlayerId,
@@ -202,6 +205,7 @@ export class Session {
         this.playerManager.clear();
         this.emittedJoinEvents.clear();
         this.engine.reset();
+        this.frameCount = 0;
 
         this.playerManager.set(this._localPlayerId, {
             id: this.localPlayerId,
@@ -280,13 +284,25 @@ export class Session {
             return { tick: this.engine.currentTick, rolledBack: false };
         }
 
-        const currentTick = this.engine.currentTick;
+        // ── Frame-delay input submission ────────────────────────────────────
+        // Submit input for THIS physical frame (frameCount), not the simulation
+        // tick.  frameCount advances monotonically 1-per-frame.  The simulation
+        // tick (engine.currentTick) starts DELAY frames late, so by the time
+        // we simulate tick T (at frame T+DELAY) both peers have had DELAY
+        // frames to deliver their tick-T input — no speculation required.
+        const submitTick = asTick(this.frameCount);
+        this.frameCount++;
 
         if (this._localRole === PlayerRole.Player) {
             if (!localInput) throw new Error('Players must provide input');
+            this.engine.setLocalInput(submitTick, localInput);
+            this.broadcastInput(submitTick, localInput);
+        }
 
-            this.engine.setLocalInput(currentTick, localInput);
-            this.broadcastInput(currentTick, localInput);
+        // During the ramp-up window don't advance the simulation yet.
+        // This gives remote peers time to receive our early inputs.
+        if (this.inputDelay > 0 && this.frameCount <= this.inputDelay) {
+            return { tick: this.engine.currentTick, rolledBack: false };
         }
 
         const result = this.engine.tick();

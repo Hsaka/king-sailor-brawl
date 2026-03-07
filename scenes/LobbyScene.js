@@ -73,7 +73,7 @@ export class LobbyScene {
                 this.transport.setPeerInstance(this.peer);
                 this.setupTransportListeners();
 
-                this.session = createSession({ game: this.worldState, transport: this.transport, config: { debug: false, localPlayerName: playerName } });
+                this.session = createSession({ game: this.worldState, transport: this.transport, config: { debug: false, localPlayerName: playerName, inputDelay: CONFIG.NETCODE.INPUT_DELAY } });
                 this.setupSessionListeners();
 
                 this.session.createRoom().then(() => {
@@ -115,7 +115,7 @@ export class LobbyScene {
                 this.transport.setPeerInstance(this.peer);
                 this.setupTransportListeners();
 
-                this.session = createSession({ game: this.worldState, transport: this.transport, config: { debug: false, localPlayerName: playerName } });
+                this.session = createSession({ game: this.worldState, transport: this.transport, config: { debug: false, localPlayerName: playerName, inputDelay: CONFIG.NETCODE.INPUT_DELAY } });
                 this.setupSessionListeners();
 
                 this.connectionStatus = 'Connecting to host...';

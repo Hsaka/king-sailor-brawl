@@ -131,6 +131,9 @@ export const CONFIG = {
         // advance confirmedTick without stalling.
         INPUT_REDUNDANCY: 10,
         DISCONNECT_TIMEOUT: 5000,
+        // Frame delay: Delays simulation by N frames so confirmed inputs arrive before simulation.
+        // At 60Hz, 5 ticks = ~83ms. Completely eliminates rollbacks for RTT <= 166ms.
+        INPUT_DELAY: 5,
     },
 
     MOBILE: {
