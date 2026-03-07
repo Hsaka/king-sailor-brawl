@@ -38,6 +38,45 @@ export class LobbyScene {
         this.shipIndex = this.ships.findIndex(s => s.id === 'cobro') || 0;
     }
 
+    buildSessionConfig(playerName) {
+        const n = CONFIG.NETCODE || {};
+        const toPosInt = (v, fallback) => {
+            const num = Number(v);
+            return Number.isInteger(num) && num > 0 ? num : fallback;
+        };
+        const toNonNegInt = (v, fallback) => {
+            const num = Number(v);
+            return Number.isInteger(num) && num >= 0 ? num : fallback;
+        };
+        const toNonNegNum = (v, fallback) => {
+            const num = Number(v);
+            return Number.isFinite(num) && num >= 0 ? num : fallback;
+        };
+
+        const baseInputDelayTicks = toNonNegInt(n.BASE_INPUT_DELAY_TICKS, 2);
+        const maxInputDelayTicks = Math.max(
+            baseInputDelayTicks,
+            toNonNegInt(n.MAX_INPUT_DELAY_TICKS, 8)
+        );
+
+        return {
+            debug: false,
+            localPlayerName: playerName,
+            tickRate: toPosInt(n.TICK_RATE, 60),
+            snapshotHistorySize: toPosInt(n.SNAPSHOT_HISTORY, 120),
+            maxSpeculationTicks: toPosInt(n.MAX_SPECULATION_TICKS, 60),
+            hashInterval: toPosInt(n.HASH_INTERVAL, 60),
+            inputRedundancy: toPosInt(n.INPUT_REDUNDANCY, 3),
+            disconnectTimeout: toPosInt(n.DISCONNECT_TIMEOUT, 5000),
+            inputSizeBytes: toPosInt(n.INPUT_BYTES, 3),
+            baseInputDelayTicks,
+            maxInputDelayTicks,
+            adaptiveInputDelay: typeof n.ADAPTIVE_INPUT_DELAY === 'boolean' ? n.ADAPTIVE_INPUT_DELAY : true,
+            adaptiveDelayUpdateInterval: toPosInt(n.ADAPTIVE_DELAY_UPDATE_INTERVAL, 30),
+            jitterBufferMs: toNonNegNum(n.JITTER_BUFFER_MS, 8),
+        };
+    }
+
     onEnter() {
         _buttons = [];
         this.fp.reset();
@@ -73,7 +112,11 @@ export class LobbyScene {
                 this.transport.setPeerInstance(this.peer);
                 this.setupTransportListeners();
 
-                this.session = createSession({ game: this.worldState, transport: this.transport, config: { debug: false, localPlayerName: playerName } });
+                this.session = createSession({
+                    game: this.worldState,
+                    transport: this.transport,
+                    config: this.buildSessionConfig(playerName),
+                });
                 this.setupSessionListeners();
 
                 this.session.createRoom().then(() => {
@@ -115,7 +158,11 @@ export class LobbyScene {
                 this.transport.setPeerInstance(this.peer);
                 this.setupTransportListeners();
 
-                this.session = createSession({ game: this.worldState, transport: this.transport, config: { debug: false, localPlayerName: playerName } });
+                this.session = createSession({
+                    game: this.worldState,
+                    transport: this.transport,
+                    config: this.buildSessionConfig(playerName),
+                });
                 this.setupSessionListeners();
 
                 this.connectionStatus = 'Connecting to host...';

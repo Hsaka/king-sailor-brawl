@@ -7,6 +7,7 @@ import { Minimap } from '../game/Minimap.js';
 import { assetManager } from '../utils/AssetManager.js';
 import { HUD } from '../ui/HUD.js';
 import { WheelControl } from '../ui/WheelControl.js';
+import { SessionState } from '../netcode/index.js';
 
 let _buttons = [];
 function regBtn(x, y, w, h, id, cb) { _buttons.push({ x, y, w, h, id, cb }); }
@@ -33,6 +34,12 @@ export class GameScene {
         this.hud = new HUD();
         this.gameOverTimer = -1;
         this.spectateId = null;
+        this.simTickMs = 1000 / CONFIG.NETCODE.TICK_RATE;
+        this.simAccumulatorMs = 0;
+        this.simLastTimeMs = 0;
+        this.maxCatchUpTicksPerFrame = Math.max(1, CONFIG.NETCODE.MAX_CATCH_UP_TICKS_PER_FRAME || 4);
+        this._autoPausedForHidden = false;
+        this._visibilityHandler = null;
 
         // Wheel control scheme
         this.wheelControl = CONFIG.MOVEMENT.WHEEL_CONTROL_SCHEME ? new WheelControl() : null;
@@ -118,6 +125,14 @@ export class GameScene {
     onEnter() {
         _buttons = [];
         if (!this.session) return;
+        this.simAccumulatorMs = 0;
+        this.simLastTimeMs = performance.now();
+        this._autoPausedForHidden = false;
+
+        if (!this._visibilityHandler) {
+            this._visibilityHandler = () => this.onVisibilityChange();
+            document.addEventListener('visibilitychange', this._visibilityHandler);
+        }
         const local = this.worldState.players.get(this.worldState.localPlayerId);
         if (local) {
             this.camX = local.x;
@@ -136,6 +151,33 @@ export class GameScene {
             this.wheelControl.attach(canvas);
             // Enable left-joystick suppression for the duration of this scene
             GameScene._suppressLeftJoystick = true;
+        }
+    }
+
+    onVisibilityChange() {
+        if (!this.session) return;
+
+        if (document.visibilityState === 'hidden') {
+            if (this.session.isHost && this.session.state === SessionState.Playing) {
+                this._autoPausedForHidden = true;
+                try {
+                    this.session.pause();
+                } catch { }
+            }
+            return;
+        }
+
+        this.simAccumulatorMs = 0;
+        this.simLastTimeMs = performance.now();
+
+        if (this.session.isHost) {
+            if (this._autoPausedForHidden && this.session.state === SessionState.Paused) {
+                this.session.syncState?.();
+                this.session.resume();
+            }
+            this._autoPausedForHidden = false;
+        } else if (this.session.state === SessionState.Playing || this.session.state === SessionState.Paused) {
+            this.session.requestSync?.();
         }
     }
 
@@ -207,8 +249,29 @@ export class GameScene {
     onUpdate() {
         if (!this.session) return;
 
-        const input = this.updateLocalInput();
-        this.session.tick(input);
+        const now = performance.now();
+        if (!this.simLastTimeMs) this.simLastTimeMs = now;
+        let frameDeltaMs = now - this.simLastTimeMs;
+        this.simLastTimeMs = now;
+        frameDeltaMs = Math.max(0, Math.min(250, frameDeltaMs));
+        this.simAccumulatorMs += frameDeltaMs;
+
+        let ticksToProcess = 1;
+        if (this.simTickMs > 0 && this.simAccumulatorMs >= this.simTickMs) {
+            const extraTicks = Math.floor(this.simAccumulatorMs / this.simTickMs);
+            this.simAccumulatorMs -= extraTicks * this.simTickMs;
+            ticksToProcess += extraTicks;
+        }
+        ticksToProcess = Math.min(this.maxCatchUpTicksPerFrame, ticksToProcess);
+
+        for (let i = 0; i < ticksToProcess; i++) {
+            const input = this.updateLocalInput();
+            this.session.tick(input);
+        }
+
+        if (ticksToProcess === this.maxCatchUpTicksPerFrame && this.simAccumulatorMs > this.simTickMs) {
+            this.simAccumulatorMs = this.simTickMs;
+        }
 
         // Update camera targeting smoothly
         let focusId = this.worldState.localPlayerId;
@@ -499,6 +562,10 @@ export class GameScene {
     }
 
     onExit() {
+        if (this._visibilityHandler) {
+            document.removeEventListener('visibilitychange', this._visibilityHandler);
+            this._visibilityHandler = null;
+        }
         // Detach wheel touch listeners
         if (this.wheelControl) {
             this.wheelControl.detach();

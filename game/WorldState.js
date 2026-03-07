@@ -25,11 +25,15 @@ export class WorldState {
         return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     }
 
+    getSortedPlayerEntries() {
+        return Array.from(this.players.entries()).sort(([a], [b]) => a.localeCompare(b));
+    }
+
     resetLevel() {
         this.seed = 1337;
         this.debris = [];
 
-        const playerIds = Array.from(this.players.keys());
+        const playerIds = this.getSortedPlayerEntries().map(([id]) => id);
         for (const id of playerIds) {
             const p = this.players.get(id);
 
@@ -55,6 +59,7 @@ export class WorldState {
             p.speedTier = ShipDefinitions.get(p.shipId).defaultSpeedTier;
             p.knockbackX = 0;
             p.knockbackY = 0;
+            this.lastInput.set(id, 0);
         }
     }
 
@@ -92,6 +97,7 @@ export class WorldState {
             knockbackX: 0,
             knockbackY: 0
         });
+        this.lastInput.set(id, 0);
     }
 
     addBot(id, slotIndex, shipId = 'cobro') {
@@ -115,19 +121,21 @@ export class WorldState {
     removePlayer(id) {
         this.players.delete(id);
         this.shipInstances.delete(id);
+        this.lastInput.delete(id);
     }
 
     serialize() {
-        const count = this.players.size;
+        const playerEntries = this.getSortedPlayerEntries();
+        const count = playerEntries.length;
         let bufferSize = 4 + 4 + 4 + (this.debris.length * 33); // count(4) + seed(4) + debrisCount(4) + debris(33 ea - 8 floats + 1 byte for type)
         const encoder = new TextEncoder();
         const idBytesList = [];
 
-        for (const [id] of this.players) {
+        for (const [id] of playerEntries) {
             const idb = encoder.encode(id);
             idBytesList.push(idb);
-            // 1(len)+idBytes+4(slot)+12(shipId)+4(x)+4(y)+4(heading)+4(hp)+4(kbX)+4(kbY)+1(speed)+1(alive)+1(isBot)+4(invinc)+4(slow)+20(cooldowns)
-            bufferSize += 1 + idb.length + 4 + 12 + 24 + 1 + 1 + 1 + 4 + 4 + 20;
+            // 1(len)+idBytes+4(slot)+12(shipId)+4(x)+4(y)+4(heading)+4(hp)+4(kbX)+4(kbY)+1(speed)+1(alive)+1(isBot)+4(invinc)+4(slow)+20(cooldowns)+4(lastInput)
+            bufferSize += 1 + idb.length + 4 + 12 + 24 + 1 + 1 + 1 + 4 + 4 + 20 + 4;
         }
 
         const buffer = new ArrayBuffer(bufferSize);
@@ -139,9 +147,9 @@ export class WorldState {
         view.setUint32(8, this.debris.length, true);
         let offset = 12;
 
-        let i = 0;
-        for (const [id, p] of this.players) {
-            const idb = idBytesList[i++];
+        for (let i = 0; i < playerEntries.length; i++) {
+            const [id, p] = playerEntries[i];
+            const idb = idBytesList[i];
             view.setUint8(offset, idb.length); offset += 1;
             uint8View.set(idb, offset); offset += idb.length;
 
@@ -166,6 +174,7 @@ export class WorldState {
             view.setFloat32(offset, p.cooldowns[2], true); offset += 4;
             view.setFloat32(offset, p.cooldowns[3], true); offset += 4;
             view.setFloat32(offset, p.cooldowns[4], true); offset += 4;
+            view.setUint32(offset, this.lastInput.get(id) || 0, true); offset += 4;
         }
 
         for (const d of this.debris) {
@@ -196,6 +205,7 @@ export class WorldState {
         let offset = 12;
 
         this.players.clear();
+        this.lastInput.clear();
         const decoder = new TextDecoder();
 
         for (let i = 0; i < count; i++) {
@@ -225,8 +235,10 @@ export class WorldState {
             cooldowns[2] = view.getFloat32(offset, true); offset += 4;
             cooldowns[3] = view.getFloat32(offset, true); offset += 4;
             cooldowns[4] = view.getFloat32(offset, true); offset += 4;
+            const lastFlags = view.getUint32(offset, true); offset += 4;
 
             this.players.set(id, { slot, shipId, x, y, heading, speedTier, health, alive, isBot, invincibilityTimer, slowTimer, cooldowns, knockbackX, knockbackY });
+            this.lastInput.set(id, lastFlags);
         }
 
         this.debris = [];
@@ -245,6 +257,12 @@ export class WorldState {
             const typeStr = this.BOMB_TYPES[flag & 0x7F] || 'damage';
 
             this.debris.push({ x, y, vx, vy, life, damage, radius, duration, spriteKey: isBomb ? 'bomb' : 'debris', type: typeStr });
+        }
+
+        for (const id of this.shipInstances.keys()) {
+            if (!this.players.has(id)) {
+                this.shipInstances.delete(id);
+            }
         }
     }
 
@@ -277,7 +295,7 @@ export class WorldState {
 
         let nearestEnemy = null;
         let minEnemyDist = Infinity;
-        for (const [otherId, targetPdata] of this.players) {
+        for (const [otherId, targetPdata] of this.getSortedPlayerEntries()) {
             if (otherId === id || !targetPdata.alive) continue;
             const dx = targetPdata.x - pdata.x;
             const dy = targetPdata.y - pdata.y;
@@ -365,7 +383,9 @@ export class WorldState {
 
     step(inputs) {
         const dt = 1 / CONFIG.NETCODE.TICK_RATE;
-        for (const [id, pdata] of this.players) {
+        const sortedPlayers = this.getSortedPlayerEntries();
+
+        for (const [id, pdata] of sortedPlayers) {
             let flags = 0;
             if (pdata.isBot) {
                 flags = this.computeBotInput(id, dt);
@@ -431,13 +451,13 @@ export class WorldState {
 
         // Check if match ended
         let aliveCount = 0;
-        for (const p of this.players.values()) {
+        for (const [, p] of sortedPlayers) {
             if (p.alive) aliveCount++;
         }
         const matchEnded = aliveCount <= 1;
 
         // Process Combat & Attack Zones
-        for (const [id, pdata] of this.players) {
+        for (const [id, pdata] of sortedPlayers) {
             if (!pdata.alive) continue;
 
             const def = ShipDefinitions.get(pdata.shipId);
@@ -499,7 +519,7 @@ export class WorldState {
                         }
                     } else {
                         // Check targets inside cone
-                        for (const [targetId, targetPdata] of this.players) {
+                        for (const [targetId, targetPdata] of sortedPlayers) {
                             if (id === targetId || !targetPdata.alive) continue;
 
                             const dx = targetPdata.x - pdata.x;
@@ -554,7 +574,7 @@ export class WorldState {
             }
 
             // Debris Ship collision
-            for (const [targetId, targetPdata] of this.players) {
+            for (const [targetId, targetPdata] of sortedPlayers) {
                 if (!targetPdata.alive) continue;
 
                 const targetDef = ShipDefinitions.get(targetPdata.shipId);
@@ -594,7 +614,7 @@ export class WorldState {
 
         // Process Death Zone
         const map = CONFIG.MAPS[0];
-        for (const [id, pdata] of this.players) {
+        for (const [id, pdata] of sortedPlayers) {
             if (!pdata.alive) continue;
 
             if (pdata.x < map.deathZoneDepth || pdata.x > map.width - map.deathZoneDepth ||
@@ -612,12 +632,11 @@ export class WorldState {
         }
 
         // Process Ship-to-Ship Collisions
-        const playerEntries = Array.from(this.players.entries());
-        for (let i = 0; i < playerEntries.length; i++) {
-            const [id1, p1] = playerEntries[i];
+        for (let i = 0; i < sortedPlayers.length; i++) {
+            const [id1, p1] = sortedPlayers[i];
             if (!p1.alive) continue;
-            for (let j = i + 1; j < playerEntries.length; j++) {
-                const [id2, p2] = playerEntries[j];
+            for (let j = i + 1; j < sortedPlayers.length; j++) {
+                const [id2, p2] = sortedPlayers[j];
                 if (!p2.alive) continue;
 
                 const def1 = ShipDefinitions.get(p1.shipId);
@@ -673,13 +692,14 @@ export class WorldState {
 
     hash() {
         let h = this.seed;
-        for (const [id, p] of this.players) {
+        for (const [id, p] of this.getSortedPlayerEntries()) {
             h = ((h << 5) - h + Math.floor(p.x * 10)) | 0;
             h = ((h << 5) - h + Math.floor(p.y * 10)) | 0;
             h = ((h << 5) - h + Math.floor(p.health * 10)) | 0;
             h = ((h << 5) - h + Math.floor((p.knockbackX || 0) * 10)) | 0;
             h = ((h << 5) - h + Math.floor((p.knockbackY || 0) * 10)) | 0;
             h = ((h << 5) - h + Math.floor((p.slowTimer || 0) * 10)) | 0;
+            h = ((h << 5) - h + (this.lastInput.get(id) || 0)) | 0;
         }
         for (const d of this.debris) {
             h = ((h << 5) - h + Math.floor(d.x * 10)) | 0;

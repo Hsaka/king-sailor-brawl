@@ -21,6 +21,12 @@ export const DEFAULT_SESSION_CONFIG = {
     desyncAuthority: DesyncAuthority.Peer,
     lagReportThreshold: 30,
     inputRedundancy: 3,
+    inputSizeBytes: 3,
+    baseInputDelayTicks: 2,
+    maxInputDelayTicks: 8,
+    adaptiveInputDelay: true,
+    adaptiveDelayUpdateInterval: 30,
+    jitterBufferMs: 8,
     joinRateLimitRequests: 3,
     joinRateLimitWindowMs: 10000,
 };
@@ -67,6 +73,24 @@ export function validateSessionConfig(config) {
     }
     if (config.disconnectTimeout <= 0) {
         throw new ValidationError('disconnectTimeout must be greater than 0', 'disconnectTimeout', config.disconnectTimeout);
+    }
+    if (!Number.isInteger(config.inputSizeBytes) || config.inputSizeBytes <= 0) {
+        throw new ValidationError('inputSizeBytes must be a positive integer', 'inputSizeBytes', config.inputSizeBytes);
+    }
+    if (!Number.isInteger(config.baseInputDelayTicks) || config.baseInputDelayTicks < 0) {
+        throw new ValidationError('baseInputDelayTicks must be an integer >= 0', 'baseInputDelayTicks', config.baseInputDelayTicks);
+    }
+    if (!Number.isInteger(config.maxInputDelayTicks) || config.maxInputDelayTicks < config.baseInputDelayTicks) {
+        throw new ValidationError('maxInputDelayTicks must be >= baseInputDelayTicks', 'maxInputDelayTicks', config.maxInputDelayTicks);
+    }
+    if (!Number.isInteger(config.adaptiveDelayUpdateInterval) || config.adaptiveDelayUpdateInterval <= 0) {
+        throw new ValidationError('adaptiveDelayUpdateInterval must be a positive integer', 'adaptiveDelayUpdateInterval', config.adaptiveDelayUpdateInterval);
+    }
+    if (typeof config.adaptiveInputDelay !== 'boolean') {
+        throw new ValidationError('adaptiveInputDelay must be a boolean', 'adaptiveInputDelay', config.adaptiveInputDelay);
+    }
+    if (!Number.isFinite(config.jitterBufferMs) || config.jitterBufferMs < 0) {
+        throw new ValidationError('jitterBufferMs must be >= 0', 'jitterBufferMs', config.jitterBufferMs);
     }
 }
 

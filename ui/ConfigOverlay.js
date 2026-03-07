@@ -93,6 +93,49 @@ export class ConfigOverlay {
         this.loadConfigs();
     }
 
+    isPlainObject(value) {
+        return value !== null && typeof value === 'object' && !Array.isArray(value);
+    }
+
+    deepMerge(base, override) {
+        if (Array.isArray(base)) {
+            return Array.isArray(override)
+                ? JSON.parse(JSON.stringify(override))
+                : JSON.parse(JSON.stringify(base));
+        }
+
+        if (!this.isPlainObject(base)) {
+            return override !== undefined ? override : base;
+        }
+
+        const result = {};
+        for (const key of Object.keys(base)) {
+            result[key] = this.deepMerge(base[key], undefined);
+        }
+
+        if (!this.isPlainObject(override)) {
+            return result;
+        }
+
+        for (const [key, value] of Object.entries(override)) {
+            if (key in result) {
+                result[key] = this.deepMerge(result[key], value);
+            } else {
+                result[key] = JSON.parse(JSON.stringify(value));
+            }
+        }
+
+        return result;
+    }
+
+    applyConfigToRuntime(newConfig) {
+        const merged = this.deepMerge(DEFAULT_CONFIG, newConfig);
+        for (const key of Object.keys(CONFIG)) {
+            delete CONFIG[key];
+        }
+        Object.assign(CONFIG, merged);
+    }
+
     buildForm(obj, parentEl, path) {
         const allowedTopLevel = ['MOVEMENT', 'COMBAT', 'DEATH_ZONE', 'MAPS', 'SHIPS'];
 
@@ -328,7 +371,7 @@ export class ConfigOverlay {
 
     applyChanges() {
         this.syncInputsToCurrentConfig();
-        Object.assign(CONFIG, this.currentConfig);
+        this.applyConfigToRuntime(this.currentConfig);
 
         // Save
         this.saveConfigs();
@@ -366,7 +409,7 @@ export class ConfigOverlay {
             reader.onload = event => {
                 try {
                     const parsed = JSON.parse(event.target.result);
-                    Object.assign(this.currentConfig, parsed);
+                    this.currentConfig = this.deepMerge(this.currentConfig, parsed);
                     this.rebuildForm();
                 } catch (err) {
                     console.error('Failed to parse config JSON', err);
@@ -407,7 +450,7 @@ export class ConfigOverlay {
         if (saved) {
             try {
                 const parsed = JSON.parse(saved);
-                Object.assign(CONFIG, parsed);
+                this.applyConfigToRuntime(parsed);
                 // No need to refresh form here as show() does it using currentConfig
             } catch (e) {
                 console.error('Failed to load configs', e);
