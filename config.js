@@ -122,10 +122,14 @@ export const CONFIG = {
 
     NETCODE: {
         TICK_RATE: 60,
-        SNAPSHOT_HISTORY: 120,
-        MAX_SPECULATION_TICKS: 60,
+        SNAPSHOT_HISTORY: 240,
+        MAX_SPECULATION_TICKS: 120,
         HASH_INTERVAL: 60,
-        INPUT_REDUNDANCY: 3,
+        // High redundancy compensates for HOL-blocking on PeerJS's reliable SCTP channel:
+        // each input packet carries the last 10 ticks of input, so even if packets are
+        // delayed/bunched by retransmission, the engine always has enough history to
+        // advance confirmedTick without stalling.
+        INPUT_REDUNDANCY: 10,
         DISCONNECT_TIMEOUT: 5000,
     },
 
