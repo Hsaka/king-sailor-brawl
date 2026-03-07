@@ -37,7 +37,7 @@ export class GameScene {
         this.simTickMs = 1000 / CONFIG.NETCODE.TICK_RATE;
         this.simAccumulatorMs = 0;
         this.simLastTimeMs = 0;
-        this.maxCatchUpTicksPerFrame = Math.max(1, CONFIG.NETCODE.MAX_CATCH_UP_TICKS_PER_FRAME || 4);
+        this.maxCatchUpTicksPerFrame = Math.max(6, CONFIG.NETCODE.MAX_CATCH_UP_TICKS_PER_FRAME || 12);
         this._autoPausedForHidden = false;
         this._visibilityHandler = null;
 
@@ -262,14 +262,17 @@ export class GameScene {
             this.simAccumulatorMs -= extraTicks * this.simTickMs;
             ticksToProcess += extraTicks;
         }
-        ticksToProcess = Math.min(this.maxCatchUpTicksPerFrame, ticksToProcess);
+        const dynamicMaxCatchUp = this.session?.isHost
+            ? Math.max(this.maxCatchUpTicksPerFrame, Math.floor(this.maxCatchUpTicksPerFrame * 1.5))
+            : this.maxCatchUpTicksPerFrame;
+        ticksToProcess = Math.min(dynamicMaxCatchUp, ticksToProcess);
 
         for (let i = 0; i < ticksToProcess; i++) {
             const input = this.updateLocalInput();
             this.session.tick(input);
         }
 
-        if (ticksToProcess === this.maxCatchUpTicksPerFrame && this.simAccumulatorMs > this.simTickMs) {
+        if (ticksToProcess === dynamicMaxCatchUp && this.simAccumulatorMs > this.simTickMs) {
             this.simAccumulatorMs = this.simTickMs;
         }
 

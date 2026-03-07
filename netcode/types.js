@@ -23,7 +23,7 @@ export const DEFAULT_SESSION_CONFIG = {
     inputRedundancy: 3,
     inputSizeBytes: 3,
     baseInputDelayTicks: 2,
-    maxInputDelayTicks: 8,
+    maxInputDelayTicks: 12,
     adaptiveInputDelay: true,
     adaptiveDelayUpdateInterval: 30,
     jitterBufferMs: 8,

@@ -823,13 +823,20 @@ export class Session {
 
         this.lastAdaptiveDelayUpdateTick = currentTick;
 
+        const currentEngineTick = this.engine.currentTick;
         let worstRttMs = 0;
         let worstJitterMs = 0;
+        let worstInputLagTicks = 0;
 
         for (const player of this.playerManager.values()) {
             if (player.id === this.localPlayerId) continue;
             if (player.role !== PlayerRole.Player) continue;
             if (player.connectionState !== PlayerConnectionState.Connected) continue;
+
+            const confirmedTick = this.engine.getConfirmedTickForPlayer(player.id);
+            if (confirmedTick !== undefined) {
+                worstInputLagTicks = Math.max(worstInputLagTicks, Math.max(0, currentEngineTick - confirmedTick - 1));
+            }
 
             const metrics = this.transport.getConnectionMetrics?.(playerIdToPeerId(player.id));
             if (!metrics) continue;
@@ -839,11 +846,14 @@ export class Session {
         }
 
         const tickMs = 1000 / this.config.tickRate;
+        const rttDelay = Math.ceil(((worstRttMs * 0.5) + worstJitterMs + this.config.jitterBufferMs) / tickMs);
+        const cadenceDelay = Math.min(this.config.maxInputDelayTicks, worstInputLagTicks);
         const targetDelay = Math.min(
             this.config.maxInputDelayTicks,
             Math.max(
                 this.config.baseInputDelayTicks,
-                Math.ceil(((worstRttMs * 0.5) + worstJitterMs + this.config.jitterBufferMs) / tickMs)
+                rttDelay,
+                cadenceDelay
             )
         );
 
@@ -858,6 +868,7 @@ export class Session {
             this.emit('inputDelayChanged', this.inputDelayTicks, {
                 worstRttMs,
                 worstJitterMs,
+                worstInputLagTicks,
                 targetDelay,
             });
         }

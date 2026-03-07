@@ -56,7 +56,7 @@ export class LobbyScene {
         const baseInputDelayTicks = toNonNegInt(n.BASE_INPUT_DELAY_TICKS, 2);
         const maxInputDelayTicks = Math.max(
             baseInputDelayTicks,
-            toNonNegInt(n.MAX_INPUT_DELAY_TICKS, 8)
+            toNonNegInt(n.MAX_INPUT_DELAY_TICKS, 12)
         );
 
         return {
