@@ -39,6 +39,9 @@ export class GameScene {
         this.simClockStartMs = 0;
         this.simClockStartTick = 0;
         this._hadRollbackThisUpdate = false;
+        this._awaitingSync = false;
+        this._lastSyncRequestAtMs = 0;
+        this._sessionSyncHandler = null;
         this._autoPausedForHidden = false;
         this._visibilityHandler = null;
         this.renderShipState = new Map();
@@ -130,12 +133,25 @@ export class GameScene {
         if (!this.session) return;
         this.resetSimulationClock(this.session.currentTick);
         this._autoPausedForHidden = false;
+        this._awaitingSync = false;
+        this._lastSyncRequestAtMs = 0;
         this.renderShipState.clear();
         this.renderShips.clear();
 
         if (!this._visibilityHandler) {
             this._visibilityHandler = () => this.onVisibilityChange();
             document.addEventListener('visibilitychange', this._visibilityHandler);
+        }
+        if (!this._sessionSyncHandler) {
+            this._sessionSyncHandler = () => {
+                this._awaitingSync = false;
+                this._hadRollbackThisUpdate = false;
+                this.resetSimulationClock(this.session ? this.session.currentTick : 0);
+                this.renderShipState.clear();
+                this.renderShips.clear();
+                this.syncWheelHeadingToLocal();
+            };
+            this.session.on('synced', this._sessionSyncHandler);
         }
         const local = this.worldState.players.get(this.worldState.localPlayerId);
         if (local) {
@@ -178,15 +194,25 @@ export class GameScene {
             }
             this._autoPausedForHidden = false;
         } else if (this.session.state === SessionState.Playing || this.session.state === SessionState.Paused) {
+            this._awaitingSync = true;
+            this._lastSyncRequestAtMs = performance.now();
             this.session.requestSync?.();
         }
 
         this.resetSimulationClock(this.session.currentTick);
+        this.syncWheelHeadingToLocal();
     }
 
     resetSimulationClock(currentTick = 0) {
         this.simClockStartMs = performance.now();
         this.simClockStartTick = currentTick;
+    }
+
+    syncWheelHeadingToLocal() {
+        if (!this.wheelControl) return;
+        const local = this.worldState.players.get(this.worldState.localPlayerId);
+        if (!local) return;
+        this.wheelControl.syncToHeading(local.heading);
     }
 
     getDesiredCurrentTick(nowMs) {
@@ -310,6 +336,10 @@ export class GameScene {
             }
 
             smooth.alive = pdata.alive;
+
+            if (isLocal && hadRollback && this.wheelControl && !this.wheelControl.active) {
+                this.wheelControl.syncToHeading(pdata.heading);
+            }
         }
 
         for (const id of this.renderShipState.keys()) {
@@ -327,6 +357,16 @@ export class GameScene {
 
     onUpdate() {
         if (!this.session) return;
+
+        if (!this.session.isHost && this._awaitingSync) {
+            const nowMs = performance.now();
+            if (nowMs - this._lastSyncRequestAtMs > 600) {
+                this.session.requestSync?.();
+                this._lastSyncRequestAtMs = nowMs;
+            }
+            this.updateRenderShipState();
+            return;
+        }
 
         const now = performance.now();
         const desiredCurrentTick = this.getDesiredCurrentTick(now);
@@ -657,9 +697,14 @@ export class GameScene {
             document.removeEventListener('visibilitychange', this._visibilityHandler);
             this._visibilityHandler = null;
         }
+        if (this._sessionSyncHandler && this.session) {
+            this.session.off('synced', this._sessionSyncHandler);
+            this._sessionSyncHandler = null;
+        }
         this.renderShipState.clear();
         this.renderShips.clear();
         this._hadRollbackThisUpdate = false;
+        this._awaitingSync = false;
         // Detach wheel touch listeners
         if (this.wheelControl) {
             this.wheelControl.detach();

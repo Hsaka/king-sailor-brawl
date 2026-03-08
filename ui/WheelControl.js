@@ -71,6 +71,21 @@ export class WheelControl {
         this._touchId = null;
     }
 
+    /**
+     * Hard-align wheel demand with authoritative ship heading.
+     * Useful after rollback/sync so stale pre-sync touch state cannot keep
+     * steering toward an old target.
+     */
+    syncToHeading(headingDeg) {
+        const h = Number(headingDeg);
+        if (Number.isFinite(h)) {
+            this.targetHeading = ((h % 360) + 360) % 360;
+        }
+        this.active = false;
+        this._touchId = null;
+        this._lastAngle = null;
+    }
+
 
     /**
      * Draw the wheel.

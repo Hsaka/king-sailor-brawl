@@ -421,6 +421,7 @@ export class Session {
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.rollbackPressure = 0;
+        this.emit('synced', state.tick);
     }
 
     on(event, handler) {
@@ -617,6 +618,8 @@ export class Session {
             this.setState(SessionState.Playing);
             this.emit('gameStart');
         }
+
+        this.emit('synced', message.tick);
     }
 
     handleSyncRequest(message) {
@@ -633,6 +636,8 @@ export class Session {
         this.pendingHashMessages = [];
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.rollbackPressure = 0;
+        this.emit('synced', state.tick);
     }
 
     handleJoinRequest(peerId, message) {
