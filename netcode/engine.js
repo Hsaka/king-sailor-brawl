@@ -196,7 +196,9 @@ export class RollbackEngine {
                 if (received) {
                     input = received;
                 } else {
-                    const lastInput = this.inputBuffer.getLastConfirmedInput(playerId);
+                    const previousUsed = tick > 0 ? this.inputBuffer.getUsedInput(playerId, asTick(tick - 1)) : undefined;
+                    const lastReceived = tick > 0 ? this.inputBuffer.getLastReceivedInput(playerId, asTick(tick - 1)) : undefined;
+                    const lastInput = previousUsed ?? lastReceived ?? this.inputBuffer.getLastConfirmedInput(playerId);
                     const predicted = this.inputPredictor.predict(playerId, tick, lastInput);
                     input = this.cloneNormalizedInput(predicted ?? this.createNeutralInput());
                 }

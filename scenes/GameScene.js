@@ -34,13 +34,10 @@ export class GameScene {
         this.hud = new HUD();
         this.gameOverTimer = -1;
         this.spectateId = null;
-        this.simTickMs = 1000 / CONFIG.NETCODE.TICK_RATE;
-        this.simAccumulatorMs = 0;
-        this.simLastTimeMs = 0;
-        this.maxCatchUpTicksPerFrame = Math.max(6, CONFIG.NETCODE.MAX_CATCH_UP_TICKS_PER_FRAME || 12);
         this._autoPausedForHidden = false;
         this._visibilityHandler = null;
         this.renderShipState = new Map();
+        this.renderShips = new Map();
 
         // Wheel control scheme
         this.wheelControl = CONFIG.MOVEMENT.WHEEL_CONTROL_SCHEME ? new WheelControl() : null;
@@ -126,10 +123,9 @@ export class GameScene {
     onEnter() {
         _buttons = [];
         if (!this.session) return;
-        this.simAccumulatorMs = 0;
-        this.simLastTimeMs = performance.now();
         this._autoPausedForHidden = false;
         this.renderShipState.clear();
+        this.renderShips.clear();
 
         if (!this._visibilityHandler) {
             this._visibilityHandler = () => this.onVisibilityChange();
@@ -168,9 +164,6 @@ export class GameScene {
             }
             return;
         }
-
-        this.simAccumulatorMs = 0;
-        this.simLastTimeMs = performance.now();
 
         if (this.session.isHost) {
             if (this._autoPausedForHidden && this.session.state === SessionState.Paused) {
@@ -253,8 +246,8 @@ export class GameScene {
 
         for (const [id, pdata] of this.worldState.players) {
             const isLocal = id === localId;
-            const posAlpha = isLocal ? 0.45 : 0.28;
-            const headingAlpha = isLocal ? 0.45 : 0.3;
+            const posAlpha = isLocal ? 0.32 : 0.28;
+            const headingAlpha = isLocal ? 0.38 : 0.3;
 
             let smooth = this.renderShipState.get(id);
             if (!smooth) {
@@ -273,15 +266,22 @@ export class GameScene {
                 smooth.y = pdata.y;
                 smooth.heading = pdata.heading;
             } else {
-                smooth.x += dx * posAlpha;
-                smooth.y += dy * posAlpha;
-
                 let headingDiff = pdata.heading - smooth.heading;
                 if (headingDiff > 180) headingDiff -= 360;
                 if (headingDiff < -180) headingDiff += 360;
-                smooth.heading += headingDiff * headingAlpha;
-                if (smooth.heading >= 360) smooth.heading -= 360;
-                if (smooth.heading < 0) smooth.heading += 360;
+
+                smooth.x += dx * posAlpha;
+                smooth.y += dy * posAlpha;
+
+                // Large heading corrections are usually rollback resimulation;
+                // snap immediately to avoid visible "turn back then forward" artifacts.
+                if (Math.abs(headingDiff) > 85) {
+                    smooth.heading = pdata.heading;
+                } else {
+                    smooth.heading += headingDiff * headingAlpha;
+                    if (smooth.heading >= 360) smooth.heading -= 360;
+                    if (smooth.heading < 0) smooth.heading += 360;
+                }
             }
 
             smooth.alive = pdata.alive;
@@ -292,37 +292,22 @@ export class GameScene {
                 this.renderShipState.delete(id);
             }
         }
+
+        for (const id of this.renderShips.keys()) {
+            if (!this.worldState.players.has(id)) {
+                this.renderShips.delete(id);
+            }
+        }
     }
 
     onUpdate() {
         if (!this.session) return;
 
-        const now = performance.now();
-        if (!this.simLastTimeMs) this.simLastTimeMs = now;
-        let frameDeltaMs = now - this.simLastTimeMs;
-        this.simLastTimeMs = now;
-        frameDeltaMs = Math.max(0, Math.min(250, frameDeltaMs));
-        this.simAccumulatorMs += frameDeltaMs;
-
-        let ticksToProcess = 1;
-        if (this.simTickMs > 0 && this.simAccumulatorMs >= this.simTickMs) {
-            const extraTicks = Math.floor(this.simAccumulatorMs / this.simTickMs);
-            this.simAccumulatorMs -= extraTicks * this.simTickMs;
-            ticksToProcess += extraTicks;
-        }
-        const dynamicMaxCatchUp = this.session?.isHost
-            ? Math.max(this.maxCatchUpTicksPerFrame, Math.floor(this.maxCatchUpTicksPerFrame * 1.5))
-            : this.maxCatchUpTicksPerFrame;
-        ticksToProcess = Math.min(dynamicMaxCatchUp, ticksToProcess);
-
-        for (let i = 0; i < ticksToProcess; i++) {
-            const input = this.updateLocalInput();
-            this.session.tick(input);
-        }
-
-        if (ticksToProcess === dynamicMaxCatchUp && this.simAccumulatorMs > this.simTickMs) {
-            this.simAccumulatorMs = this.simTickMs;
-        }
+        // LittleJS already runs gameUpdate on fixed 60Hz logic ticks.
+        // Running extra rollback ticks here causes clients to simulate at
+        // different rates based on rendering cadence and device performance.
+        const input = this.updateLocalInput();
+        this.session.tick(input);
 
         this.updateRenderShipState();
 
@@ -488,10 +473,11 @@ export class GameScene {
                 ? { ...pdata, x: smooth.x, y: smooth.y, heading: smooth.heading }
                 : pdata;
 
-            // Reconstruct a temporary ship class for rendering if it doesn't exist, else use WorldState instance
-            let ship = this.worldState.shipInstances.get(id);
+            // Keep render-only ship objects separate from simulation ship instances.
+            let ship = this.renderShips.get(id);
             if (!ship) {
-                ship = new Ship(id, renderPdata); // Fallback
+                ship = new Ship(id, renderPdata);
+                this.renderShips.set(id, ship);
             } else {
                 ship.loadState(renderPdata);
             }
@@ -628,6 +614,7 @@ export class GameScene {
             this._visibilityHandler = null;
         }
         this.renderShipState.clear();
+        this.renderShips.clear();
         // Detach wheel touch listeners
         if (this.wheelControl) {
             this.wheelControl.detach();

@@ -170,6 +170,24 @@ export class InputBuffer {
         return undefined;
     }
 
+    getLastReceivedInput(playerId, upToTick) {
+        const player = this.players.get(playerId);
+        if (!player) return undefined;
+
+        let bestTick = undefined;
+        let bestInput = undefined;
+
+        for (const [tick, input] of player.received) {
+            if (tick > upToTick) continue;
+            if (bestTick === undefined || tick > bestTick) {
+                bestTick = tick;
+                bestInput = input;
+            }
+        }
+
+        return bestInput;
+    }
+
     pruneBeforeTick(tick) {
         for (const player of this.players.values()) {
             for (const t of player.received.keys()) {
