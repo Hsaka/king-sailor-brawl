@@ -40,6 +40,7 @@ export class GameScene {
         this.maxCatchUpTicksPerFrame = Math.max(6, CONFIG.NETCODE.MAX_CATCH_UP_TICKS_PER_FRAME || 12);
         this._autoPausedForHidden = false;
         this._visibilityHandler = null;
+        this.renderShipState = new Map();
 
         // Wheel control scheme
         this.wheelControl = CONFIG.MOVEMENT.WHEEL_CONTROL_SCHEME ? new WheelControl() : null;
@@ -128,6 +129,7 @@ export class GameScene {
         this.simAccumulatorMs = 0;
         this.simLastTimeMs = performance.now();
         this._autoPausedForHidden = false;
+        this.renderShipState.clear();
 
         if (!this._visibilityHandler) {
             this._visibilityHandler = () => this.onVisibilityChange();
@@ -246,6 +248,52 @@ export class GameScene {
         return inputArr;
     }
 
+    updateRenderShipState() {
+        const localId = this.worldState.localPlayerId;
+
+        for (const [id, pdata] of this.worldState.players) {
+            const isLocal = id === localId;
+            const posAlpha = isLocal ? 0.45 : 0.28;
+            const headingAlpha = isLocal ? 0.45 : 0.3;
+
+            let smooth = this.renderShipState.get(id);
+            if (!smooth) {
+                smooth = { x: pdata.x, y: pdata.y, heading: pdata.heading, alive: pdata.alive };
+                this.renderShipState.set(id, smooth);
+                continue;
+            }
+
+            const dx = pdata.x - smooth.x;
+            const dy = pdata.y - smooth.y;
+            const dist = Math.hypot(dx, dy);
+            const teleported = dist > 220 || pdata.alive !== smooth.alive;
+
+            if (teleported) {
+                smooth.x = pdata.x;
+                smooth.y = pdata.y;
+                smooth.heading = pdata.heading;
+            } else {
+                smooth.x += dx * posAlpha;
+                smooth.y += dy * posAlpha;
+
+                let headingDiff = pdata.heading - smooth.heading;
+                if (headingDiff > 180) headingDiff -= 360;
+                if (headingDiff < -180) headingDiff += 360;
+                smooth.heading += headingDiff * headingAlpha;
+                if (smooth.heading >= 360) smooth.heading -= 360;
+                if (smooth.heading < 0) smooth.heading += 360;
+            }
+
+            smooth.alive = pdata.alive;
+        }
+
+        for (const id of this.renderShipState.keys()) {
+            if (!this.worldState.players.has(id)) {
+                this.renderShipState.delete(id);
+            }
+        }
+    }
+
     onUpdate() {
         if (!this.session) return;
 
@@ -275,6 +323,8 @@ export class GameScene {
         if (ticksToProcess === dynamicMaxCatchUp && this.simAccumulatorMs > this.simTickMs) {
             this.simAccumulatorMs = this.simTickMs;
         }
+
+        this.updateRenderShipState();
 
         // Update camera targeting smoothly
         let focusId = this.worldState.localPlayerId;
@@ -306,10 +356,13 @@ export class GameScene {
         }
 
         const focusPlayer = this.worldState.players.get(focusId);
+        const focusSmooth = this.renderShipState.get(focusId);
         this.focusId = focusId;
         if (focusPlayer) {
-            this.camX += (focusPlayer.x - this.camX) * 0.1;
-            this.camY += (focusPlayer.y - this.camY) * 0.1;
+            const targetCamX = focusSmooth ? focusSmooth.x : focusPlayer.x;
+            const targetCamY = focusSmooth ? focusSmooth.y : focusPlayer.y;
+            this.camX += (targetCamX - this.camX) * 0.1;
+            this.camY += (targetCamY - this.camY) * 0.1;
 
             // Camera bounds
             const padding = this.map.deathZoneDepth;
@@ -430,12 +483,17 @@ export class GameScene {
 
         // Render Ships
         for (const [id, pdata] of this.worldState.players) {
+            const smooth = this.renderShipState.get(id);
+            const renderPdata = smooth
+                ? { ...pdata, x: smooth.x, y: smooth.y, heading: smooth.heading }
+                : pdata;
+
             // Reconstruct a temporary ship class for rendering if it doesn't exist, else use WorldState instance
             let ship = this.worldState.shipInstances.get(id);
             if (!ship) {
-                ship = new Ship(id, pdata); // Fallback
+                ship = new Ship(id, renderPdata); // Fallback
             } else {
-                ship.loadState(pdata);
+                ship.loadState(renderPdata);
             }
             const sessionPlayer = this.session?.playerManager.get(id);
             const playerName = sessionPlayer ? sessionPlayer.name : null;
@@ -569,6 +627,7 @@ export class GameScene {
             document.removeEventListener('visibilitychange', this._visibilityHandler);
             this._visibilityHandler = null;
         }
+        this.renderShipState.clear();
         // Detach wheel touch listeners
         if (this.wheelControl) {
             this.wheelControl.detach();

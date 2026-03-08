@@ -54,6 +54,7 @@ export class Session {
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.lastSyncRequestAtMs = 0;
         this.syncRequestCooldownMs = 500;
+        this.rollbackPressure = 0;
 
         this.engine = new RollbackEngine({
             game: this.game,
@@ -209,6 +210,7 @@ export class Session {
         this.inputDelayTicks = this.config.baseInputDelayTicks;
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.rollbackPressure = 0;
 
         this.playerManager.set(this._localPlayerId, {
             id: this.localPlayerId,
@@ -231,6 +233,7 @@ export class Session {
         this.inputDelayTicks = this.config.baseInputDelayTicks;
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.rollbackPressure = 0;
 
         const startTick = asTick(0);
         for (const player of this.playerManager.values()) {
@@ -299,6 +302,7 @@ export class Session {
         }
 
         const result = this.engine.tick();
+        this.observeRollbackPressure(result);
 
         if (result.error) {
             this.emit('error', result.error, { source: ErrorSource.Engine, recoverable: true, details: { tick: result.tick } });
@@ -342,6 +346,7 @@ export class Session {
         this.pendingHashMessages = [];
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.rollbackPressure = 0;
     }
 
     on(event, handler) {
@@ -507,6 +512,7 @@ export class Session {
         this.pendingHashMessages = [];
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.rollbackPressure = 0;
 
         for (const entry of message.playerTimeline) {
             const connectionState = entry.leaveTick !== null ? PlayerConnectionState.Disconnected : PlayerConnectionState.Connected;
@@ -848,12 +854,14 @@ export class Session {
         const tickMs = 1000 / this.config.tickRate;
         const rttDelay = Math.ceil(((worstRttMs * 0.5) + worstJitterMs + this.config.jitterBufferMs) / tickMs);
         const cadenceDelay = Math.min(this.config.maxInputDelayTicks, worstInputLagTicks);
+        const rollbackDelay = Math.min(this.config.maxInputDelayTicks, Math.ceil(this.rollbackPressure / 3));
         const targetDelay = Math.min(
             this.config.maxInputDelayTicks,
             Math.max(
                 this.config.baseInputDelayTicks,
                 rttDelay,
-                cadenceDelay
+                cadenceDelay,
+                rollbackDelay
             )
         );
 
@@ -869,8 +877,21 @@ export class Session {
                 worstRttMs,
                 worstJitterMs,
                 worstInputLagTicks,
+                rollbackPressure: this.rollbackPressure,
                 targetDelay,
             });
+        }
+    }
+
+    observeRollbackPressure(result) {
+        // Exponential decay so transient spikes settle naturally.
+        this.rollbackPressure *= 0.9;
+
+        if (result?.rolledBack) {
+            const rollbackTicks = Math.max(1, result.rollbackTicks ?? 1);
+            this.rollbackPressure += Math.min(20, rollbackTicks);
+        } else {
+            this.rollbackPressure = Math.max(0, this.rollbackPressure - 0.05);
         }
     }
 
