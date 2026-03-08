@@ -34,6 +34,11 @@ export class GameScene {
         this.hud = new HUD();
         this.gameOverTimer = -1;
         this.spectateId = null;
+        this.simTickMs = 1000 / CONFIG.NETCODE.TICK_RATE;
+        this.maxCatchUpTicksPerFrame = Math.max(6, CONFIG.NETCODE.MAX_CATCH_UP_TICKS_PER_FRAME || 12);
+        this.simClockStartMs = 0;
+        this.simClockStartTick = 0;
+        this._hadRollbackThisUpdate = false;
         this._autoPausedForHidden = false;
         this._visibilityHandler = null;
         this.renderShipState = new Map();
@@ -123,6 +128,7 @@ export class GameScene {
     onEnter() {
         _buttons = [];
         if (!this.session) return;
+        this.resetSimulationClock(this.session.currentTick);
         this._autoPausedForHidden = false;
         this.renderShipState.clear();
         this.renderShips.clear();
@@ -174,6 +180,22 @@ export class GameScene {
         } else if (this.session.state === SessionState.Playing || this.session.state === SessionState.Paused) {
             this.session.requestSync?.();
         }
+
+        this.resetSimulationClock(this.session.currentTick);
+    }
+
+    resetSimulationClock(currentTick = 0) {
+        this.simClockStartMs = performance.now();
+        this.simClockStartTick = currentTick;
+    }
+
+    getDesiredCurrentTick(nowMs) {
+        if (!this.simClockStartMs) {
+            this.resetSimulationClock(this.session ? this.session.currentTick : 0);
+        }
+        const elapsedMs = Math.max(0, nowMs - this.simClockStartMs);
+        const elapsedTicks = Math.floor(elapsedMs / this.simTickMs);
+        return this.simClockStartTick + elapsedTicks + 1;
     }
 
     updateLocalInput() {
@@ -243,11 +265,12 @@ export class GameScene {
 
     updateRenderShipState() {
         const localId = this.worldState.localPlayerId;
+        const hadRollback = this._hadRollbackThisUpdate;
 
         for (const [id, pdata] of this.worldState.players) {
             const isLocal = id === localId;
-            const posAlpha = isLocal ? 0.32 : 0.28;
-            const headingAlpha = isLocal ? 0.38 : 0.3;
+            const posAlpha = isLocal ? 0.85 : 0.24;
+            const headingAlpha = isLocal ? 0.85 : 0.42;
 
             let smooth = this.renderShipState.get(id);
             if (!smooth) {
@@ -259,7 +282,8 @@ export class GameScene {
             const dx = pdata.x - smooth.x;
             const dy = pdata.y - smooth.y;
             const dist = Math.hypot(dx, dy);
-            const teleported = dist > 220 || pdata.alive !== smooth.alive;
+            const rollbackJump = hadRollback && dist > 60;
+            const teleported = dist > 220 || rollbackJump || pdata.alive !== smooth.alive;
 
             if (teleported) {
                 smooth.x = pdata.x;
@@ -275,7 +299,8 @@ export class GameScene {
 
                 // Large heading corrections are usually rollback resimulation;
                 // snap immediately to avoid visible "turn back then forward" artifacts.
-                if (Math.abs(headingDiff) > 85) {
+                const snapThreshold = isLocal ? 60 : 35;
+                if (Math.abs(headingDiff) > snapThreshold || (hadRollback && !isLocal && Math.abs(headingDiff) > 18)) {
                     smooth.heading = pdata.heading;
                 } else {
                     smooth.heading += headingDiff * headingAlpha;
@@ -303,11 +328,30 @@ export class GameScene {
     onUpdate() {
         if (!this.session) return;
 
-        // LittleJS already runs gameUpdate on fixed 60Hz logic ticks.
-        // Running extra rollback ticks here causes clients to simulate at
-        // different rates based on rendering cadence and device performance.
-        const input = this.updateLocalInput();
-        this.session.tick(input);
+        const now = performance.now();
+        const desiredCurrentTick = this.getDesiredCurrentTick(now);
+        let ticksToProcess = Math.max(0, desiredCurrentTick - this.session.currentTick);
+
+        const dynamicMaxCatchUp = this.session?.isHost
+            ? Math.max(this.maxCatchUpTicksPerFrame, Math.floor(this.maxCatchUpTicksPerFrame * 1.5))
+            : this.maxCatchUpTicksPerFrame;
+
+        if (ticksToProcess > dynamicMaxCatchUp) {
+            const lagTicks = ticksToProcess - dynamicMaxCatchUp;
+            ticksToProcess = dynamicMaxCatchUp;
+
+            // If we're severely behind wall-clock, rebase to prevent endless saturation.
+            if (lagTicks > dynamicMaxCatchUp * 3) {
+                this.resetSimulationClock(this.session.currentTick + ticksToProcess);
+            }
+        }
+
+        this._hadRollbackThisUpdate = false;
+        for (let i = 0; i < ticksToProcess; i++) {
+            const input = this.updateLocalInput();
+            const result = this.session.tick(input);
+            if (result?.rolledBack) this._hadRollbackThisUpdate = true;
+        }
 
         this.updateRenderShipState();
 
@@ -615,6 +659,7 @@ export class GameScene {
         }
         this.renderShipState.clear();
         this.renderShips.clear();
+        this._hadRollbackThisUpdate = false;
         // Detach wheel touch listeners
         if (this.wheelControl) {
             this.wheelControl.detach();
