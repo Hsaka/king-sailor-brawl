@@ -39,6 +39,7 @@ export class Session {
 
         this._localPlayerId = options.localPlayerId ?? asPlayerId(this.transport.localPeerId);
         this.debug = this.config.debug;
+        this.inputPredictor = options.inputPredictor;
 
         this.playerManager = new Map();
         this.emittedJoinEvents = new Set();
@@ -56,36 +57,7 @@ export class Session {
         this.syncRequestCooldownMs = 500;
         this.rollbackPressure = 0;
 
-        this.engine = new RollbackEngine({
-            game: this.game,
-            localPlayerId: this._localPlayerId,
-            snapshotHistorySize: this.config.snapshotHistorySize,
-            maxSpeculationTicks: this.config.maxSpeculationTicks,
-            inputSizeBytes: this.config.inputSizeBytes,
-            inputPredictor: options.inputPredictor,
-            onPlayerAddDuringResimulation: (playerId, tick) => {
-                if (this.emittedJoinEvents.has(playerId)) return;
-                const playerInfo = this.playerManager.get(playerId);
-                if (playerInfo) {
-                    this.emittedJoinEvents.add(playerId);
-                    this.emit('playerJoined', playerInfo);
-                }
-            },
-            onPlayerRemoveDuringResimulation: (playerId, tick) => {
-                const playerInfo = this.playerManager.get(playerId);
-                if (playerInfo) {
-                    this.emit('playerLeft', playerInfo);
-                }
-            },
-            onRollback: (restoreTick) => {
-                for (const playerId of this.emittedJoinEvents) {
-                    const playerInfo = this.playerManager.get(playerId);
-                    if (playerInfo && playerInfo.joinTick !== null && playerInfo.joinTick > restoreTick) {
-                        this.emittedJoinEvents.delete(playerId);
-                    }
-                }
-            },
-        });
+        this.engine = this.createEngine();
 
         this.playerManager.set(this._localPlayerId, {
             id: this._localPlayerId,
@@ -143,6 +115,108 @@ export class Session {
 
     get confirmedTick() {
         return this.engine.confirmedTick;
+    }
+
+    createEngine() {
+        return new RollbackEngine({
+            game: this.game,
+            localPlayerId: this._localPlayerId,
+            snapshotHistorySize: this.config.snapshotHistorySize,
+            maxSpeculationTicks: this.config.maxSpeculationTicks,
+            inputSizeBytes: this.config.inputSizeBytes,
+            inputPredictor: this.inputPredictor,
+            onPlayerAddDuringResimulation: (playerId, tick) => {
+                if (this.emittedJoinEvents.has(playerId)) return;
+                const playerInfo = this.playerManager.get(playerId);
+                if (playerInfo) {
+                    this.emittedJoinEvents.add(playerId);
+                    this.emit('playerJoined', playerInfo);
+                }
+            },
+            onPlayerRemoveDuringResimulation: (playerId, tick) => {
+                const playerInfo = this.playerManager.get(playerId);
+                if (playerInfo) {
+                    this.emit('playerLeft', playerInfo);
+                }
+            },
+            onRollback: (restoreTick) => {
+                for (const playerId of this.emittedJoinEvents) {
+                    const playerInfo = this.playerManager.get(playerId);
+                    if (playerInfo && playerInfo.joinTick !== null && playerInfo.joinTick > restoreTick) {
+                        this.emittedJoinEvents.delete(playerId);
+                    }
+                }
+            },
+        });
+    }
+
+    getJoinAcceptConfigPayload() {
+        return {
+            tickRate: this.config.tickRate,
+            maxPlayers: this.config.maxPlayers,
+            topology: this.config.topology,
+            snapshotHistorySize: this.config.snapshotHistorySize,
+            maxSpeculationTicks: this.config.maxSpeculationTicks,
+            hashInterval: this.config.hashInterval,
+            disconnectTimeout: this.config.disconnectTimeout,
+            desyncAuthority: this.config.desyncAuthority,
+            lagReportThreshold: this.config.lagReportThreshold,
+            inputRedundancy: this.config.inputRedundancy,
+            inputSizeBytes: this.config.inputSizeBytes,
+            baseInputDelayTicks: this.config.baseInputDelayTicks,
+            maxInputDelayTicks: this.config.maxInputDelayTicks,
+            adaptiveInputDelay: this.config.adaptiveInputDelay,
+            adaptiveDelayUpdateInterval: this.config.adaptiveDelayUpdateInterval,
+            jitterBufferMs: this.config.jitterBufferMs,
+            joinRateLimitRequests: this.config.joinRateLimitRequests,
+            joinRateLimitWindowMs: this.config.joinRateLimitWindowMs,
+        };
+    }
+
+    applyHostSessionConfig(hostConfig) {
+        if (!hostConfig || typeof hostConfig !== 'object') return;
+
+        const allowedKeys = [
+            'tickRate',
+            'maxPlayers',
+            'topology',
+            'snapshotHistorySize',
+            'maxSpeculationTicks',
+            'hashInterval',
+            'disconnectTimeout',
+            'desyncAuthority',
+            'lagReportThreshold',
+            'inputRedundancy',
+            'inputSizeBytes',
+            'baseInputDelayTicks',
+            'maxInputDelayTicks',
+            'adaptiveInputDelay',
+            'adaptiveDelayUpdateInterval',
+            'jitterBufferMs',
+            'joinRateLimitRequests',
+            'joinRateLimitWindowMs',
+        ];
+
+        const sanitized = {};
+        for (const key of allowedKeys) {
+            if (Object.prototype.hasOwnProperty.call(hostConfig, key)) {
+                sanitized[key] = hostConfig[key];
+            }
+        }
+
+        const merged = { ...this.config, ...sanitized };
+        validateSessionConfig(merged);
+
+        this.config = merged;
+        this.debug = this.config.debug;
+        this.inputRedundancy = this.config.inputRedundancy;
+        this.inputSizeBytes = this.config.inputSizeBytes;
+        this.inputDelayTicks = this.config.baseInputDelayTicks;
+        this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.rollbackPressure = 0;
+        this.pendingHashMessages = [];
+        this.engine = this.createEngine();
     }
 
     destroy() {
@@ -578,7 +652,8 @@ export class Session {
         }
 
         const playerIds = connectedPlayers.map(p => ({ id: p.id, name: p.name || '' }));
-        this.transport.send(peerId, encodeMessage(createJoinAccept(playerId, this._roomId, { tickRate: this.config.tickRate, maxPlayers: this.config.maxPlayers }, playerIds)), true);
+        const joinConfig = this.getJoinAcceptConfigPayload();
+        this.transport.send(peerId, encodeMessage(createJoinAccept(playerId, this._roomId, joinConfig, playerIds)), true);
 
         const playerRole = message.role ?? PlayerRole.Player;
         const playerInfo = {
@@ -618,6 +693,22 @@ export class Session {
     }
 
     handleJoinAccept(message) {
+        if (message?.roomId) {
+            this._roomId = message.roomId;
+        }
+
+        try {
+            this.applyHostSessionConfig(message?.config);
+        } catch (error) {
+            this.setState(SessionState.Disconnected);
+            this.emit(
+                'error',
+                error instanceof Error ? error : new Error(String(error)),
+                { source: ErrorSource.Protocol, recoverable: false, details: { phase: 'joinAcceptConfig' } }
+            );
+            return;
+        }
+
         if (this._state === SessionState.Connecting) {
             this.setState(SessionState.Lobby);
         }

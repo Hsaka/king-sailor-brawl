@@ -1,6 +1,7 @@
 import { CONFIG } from '../config.js';
 
 let DEFAULT_CONFIG = null;
+const PERSISTED_TOP_LEVEL = ['MOVEMENT', 'COMBAT', 'DEATH_ZONE', 'MAPS', 'SHIPS'];
 
 export class ConfigOverlay {
     constructor() {
@@ -136,8 +137,19 @@ export class ConfigOverlay {
         Object.assign(CONFIG, merged);
     }
 
+    getPersistableConfigSnapshot(configObj) {
+        const source = configObj || CONFIG;
+        const snapshot = {};
+        for (const key of PERSISTED_TOP_LEVEL) {
+            if (Object.prototype.hasOwnProperty.call(source, key)) {
+                snapshot[key] = JSON.parse(JSON.stringify(source[key]));
+            }
+        }
+        return snapshot;
+    }
+
     buildForm(obj, parentEl, path) {
-        const allowedTopLevel = ['MOVEMENT', 'COMBAT', 'DEATH_ZONE', 'MAPS', 'SHIPS'];
+        const allowedTopLevel = PERSISTED_TOP_LEVEL;
 
         for (const key in obj) {
             if (path === '' && !allowedTopLevel.includes(key)) continue;
@@ -371,7 +383,8 @@ export class ConfigOverlay {
 
     applyChanges() {
         this.syncInputsToCurrentConfig();
-        this.applyConfigToRuntime(this.currentConfig);
+        const persistable = this.getPersistableConfigSnapshot(this.currentConfig);
+        this.applyConfigToRuntime(persistable);
 
         // Save
         this.saveConfigs();
@@ -380,7 +393,8 @@ export class ConfigOverlay {
 
     exportConfig() {
         this.syncInputsToCurrentConfig();
-        const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(this.currentConfig, null, 2));
+        const persistable = this.getPersistableConfigSnapshot(this.currentConfig);
+        const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(persistable, null, 2));
         const downloadAnchorNode = document.createElement('a');
         downloadAnchorNode.setAttribute("href", dataStr);
         downloadAnchorNode.setAttribute("download", "config.json");
@@ -409,7 +423,8 @@ export class ConfigOverlay {
             reader.onload = event => {
                 try {
                     const parsed = JSON.parse(event.target.result);
-                    this.currentConfig = this.deepMerge(this.currentConfig, parsed);
+                    const persistable = this.getPersistableConfigSnapshot(parsed);
+                    this.currentConfig = this.deepMerge(this.currentConfig, persistable);
                     this.rebuildForm();
                 } catch (err) {
                     console.error('Failed to parse config JSON', err);
@@ -442,7 +457,8 @@ export class ConfigOverlay {
     }
 
     saveConfigs() {
-        localStorage.setItem('gameConfigs', JSON.stringify(CONFIG));
+        const persistable = this.getPersistableConfigSnapshot(CONFIG);
+        localStorage.setItem('gameConfigs', JSON.stringify(persistable));
     }
 
     loadConfigs() {
@@ -450,7 +466,8 @@ export class ConfigOverlay {
         if (saved) {
             try {
                 const parsed = JSON.parse(saved);
-                this.applyConfigToRuntime(parsed);
+                const persistable = this.getPersistableConfigSnapshot(parsed);
+                this.applyConfigToRuntime(persistable);
                 // No need to refresh form here as show() does it using currentConfig
             } catch (e) {
                 console.error('Failed to load configs', e);
