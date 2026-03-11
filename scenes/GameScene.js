@@ -300,8 +300,69 @@ export class GameScene {
 
             let smooth = this.renderShipState.get(id);
             if (!smooth) {
-                smooth = { x: pdata.x, y: pdata.y, heading: pdata.heading, alive: pdata.alive };
+                smooth = {
+                    x: pdata.x,
+                    y: pdata.y,
+                    heading: pdata.heading,
+                    alive: pdata.alive,
+                    simX: pdata.x,
+                    simY: pdata.y,
+                    simHeading: pdata.heading,
+                };
                 this.renderShipState.set(id, smooth);
+                continue;
+            }
+
+            if (isLocal) {
+                const prevSimX = smooth.simX ?? pdata.x;
+                const prevSimY = smooth.simY ?? pdata.y;
+                const prevSimHeading = smooth.simHeading ?? pdata.heading;
+
+                smooth.x += pdata.x - prevSimX;
+                smooth.y += pdata.y - prevSimY;
+
+                let simHeadingStep = pdata.heading - prevSimHeading;
+                if (simHeadingStep > 180) simHeadingStep -= 360;
+                if (simHeadingStep < -180) simHeadingStep += 360;
+                smooth.heading += simHeadingStep;
+                if (smooth.heading >= 360) smooth.heading -= 360;
+                if (smooth.heading < 0) smooth.heading += 360;
+
+                const correctionDx = pdata.x - smooth.x;
+                const correctionDy = pdata.y - smooth.y;
+                const correctionDist = Math.hypot(correctionDx, correctionDy);
+                const teleported = correctionDist > 140 || pdata.alive !== smooth.alive;
+
+                if (teleported) {
+                    smooth.x = pdata.x;
+                    smooth.y = pdata.y;
+                    smooth.heading = pdata.heading;
+                } else {
+                    const localCorrectionAlpha = hadRollback ? 0.45 : 0.22;
+                    smooth.x += correctionDx * localCorrectionAlpha;
+                    smooth.y += correctionDy * localCorrectionAlpha;
+
+                    let headingCorrection = pdata.heading - smooth.heading;
+                    if (headingCorrection > 180) headingCorrection -= 360;
+                    if (headingCorrection < -180) headingCorrection += 360;
+
+                    if (Math.abs(headingCorrection) > 75) {
+                        smooth.heading = pdata.heading;
+                    } else {
+                        smooth.heading += headingCorrection * (hadRollback ? 0.55 : 0.28);
+                        if (smooth.heading >= 360) smooth.heading -= 360;
+                        if (smooth.heading < 0) smooth.heading += 360;
+                    }
+                }
+
+                smooth.simX = pdata.x;
+                smooth.simY = pdata.y;
+                smooth.simHeading = pdata.heading;
+                smooth.alive = pdata.alive;
+
+                if (hadRollback && this.wheelControl && !this.wheelControl.active) {
+                    this.wheelControl.syncToHeading(pdata.heading);
+                }
                 continue;
             }
 
