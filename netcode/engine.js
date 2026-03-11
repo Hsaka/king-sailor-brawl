@@ -9,6 +9,7 @@ export class RollbackEngine {
         this.maxSpeculationTicks = config.maxSpeculationTicks ?? 60;
         this.pruneBufferTicks = config.pruneBufferTicks ?? 10;
         this.inputPredictor = config.inputPredictor ?? DEFAULT_INPUT_PREDICTOR;
+        this.inputSizeBytes = config.inputSizeBytes ?? 0;
         this.onPlayerAddDuringResimulation = config.onPlayerAddDuringResimulation;
         this.onPlayerRemoveDuringResimulation = config.onPlayerRemoveDuringResimulation;
         this.onRollback = config.onRollback;
@@ -44,14 +45,13 @@ export class RollbackEngine {
     }
 
     setLocalInput(tick, input) {
-        const inputCopy = new Uint8Array(input.length);
-        inputCopy.set(input);
+        const inputCopy = this.cloneNormalizedInput(input);
         this.localInputs.set(tick, inputCopy);
         this.inputBuffer.receiveInput(this.localPlayerId, tick, inputCopy);
     }
 
     receiveRemoteInput(playerId, tick, input) {
-        this.inputBuffer.receiveInput(playerId, tick, input);
+        this.inputBuffer.receiveInput(playerId, tick, this.cloneNormalizedInput(input));
     }
 
     getLocalInput(tick) {
@@ -190,14 +190,17 @@ export class RollbackEngine {
             let input;
 
             if (playerId === this.localPlayerId) {
-                input = this.localInputs.get(tick) ?? new Uint8Array(0);
+                input = this.localInputs.get(tick) ?? this.createNeutralInput();
             } else {
                 const received = this.inputBuffer.getInput(playerId, tick);
                 if (received) {
                     input = received;
                 } else {
-                    const lastInput = this.inputBuffer.getLastConfirmedInput(playerId);
-                    input = this.inputPredictor.predict(playerId, tick, lastInput);
+                    const previousUsed = tick > 0 ? this.inputBuffer.getUsedInput(playerId, asTick(tick - 1)) : undefined;
+                    const lastReceived = tick > 0 ? this.inputBuffer.getLastReceivedInput(playerId, asTick(tick - 1)) : undefined;
+                    const lastInput = previousUsed ?? lastReceived ?? this.inputBuffer.getLastConfirmedInput(playerId);
+                    const predicted = this.inputPredictor.predict(playerId, tick, lastInput);
+                    input = this.cloneNormalizedInput(predicted ?? this.createNeutralInput());
                 }
             }
 
@@ -230,7 +233,8 @@ export class RollbackEngine {
     }
 
     getCurrentHash() {
-        return this.gameHash(this._currentTick);
+        const latestStateTick = asTick(this._currentTick - 1);
+        return this.gameHash(latestStateTick);
     }
 
     getState() {
@@ -248,7 +252,7 @@ export class RollbackEngine {
 
         return {
             tick: this._currentTick,
-            state: this.gameSerialize(this._currentTick),
+            state: this.gameSerialize(asTick(this._currentTick - 1)),
             playerTimeline,
         };
     }
@@ -343,5 +347,21 @@ export class RollbackEngine {
 
     gameHash(tick) {
         return this.wrapGameOperation('hash', tick, () => this.game.hash());
+    }
+
+    createNeutralInput() {
+        return new Uint8Array(Math.max(0, this.inputSizeBytes));
+    }
+
+    cloneNormalizedInput(input) {
+        const src = input instanceof Uint8Array ? input : new Uint8Array(input ?? []);
+        if (this.inputSizeBytes > 0) {
+            const normalized = new Uint8Array(this.inputSizeBytes);
+            normalized.set(src.subarray(0, this.inputSizeBytes));
+            return normalized;
+        }
+        const copy = new Uint8Array(src.length);
+        copy.set(src);
+        return copy;
     }
 }

@@ -467,13 +467,15 @@ function decodeJoinRequestMessage(view, limits) {
 function encodeJoinAcceptMessage(msg) {
     const playerIdBytes = textEncoder.encode(msg.playerId);
     const roomIdBytes = textEncoder.encode(msg.roomId);
+    const configJson = JSON.stringify(msg.config || {});
+    const configBytes = textEncoder.encode(configJson);
 
     let playersSize = 1;
     for (const p of msg.players) {
         playersSize += 2 + textEncoder.encode(p.id).length + 2 + textEncoder.encode(p.name || '').length;
     }
 
-    const buffer = new Uint8Array(1 + 2 + playerIdBytes.length + 2 + roomIdBytes.length + 2 + 1 + playersSize);
+    const buffer = new Uint8Array(1 + 2 + playerIdBytes.length + 2 + roomIdBytes.length + 2 + 1 + playersSize + 2 + configBytes.length);
     const view = new DataView(buffer.buffer);
 
     let offset = 0;
@@ -489,6 +491,8 @@ function encodeJoinAcceptMessage(msg) {
         offset += writeString(view, offset, p.id);
         offset += writeString(view, offset, p.name || '');
     }
+
+    offset += writeString(view, offset, configJson);
 
     return buffer;
 }
@@ -520,7 +524,20 @@ function decodeJoinAcceptMessage(view, limits) {
         players.push({ id, name });
     }
 
-    return { type: MessageType.JoinAccept, playerId, roomId, config: { tickRate, maxPlayers }, players };
+    let extraConfig = {};
+    if (offset < view.byteLength) {
+        const [configJson] = readString(view, offset, msgType, limits.maxStringLength * 4);
+        try {
+            const parsed = JSON.parse(configJson);
+            if (parsed && typeof parsed === 'object') {
+                extraConfig = parsed;
+            }
+        } catch {
+            extraConfig = {};
+        }
+    }
+
+    return { type: MessageType.JoinAccept, playerId, roomId, config: { tickRate, maxPlayers, ...extraConfig }, players };
 }
 
 function encodeJoinRejectMessage(msg) {

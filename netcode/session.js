@@ -10,13 +10,12 @@ import {
     playerIdToPeerId,
     validateSessionConfig,
 } from './types.js';
-import { encodeMessage, decodeMessage, DEFAULT_PROTOCOL_LIMITS } from './encoding.js';
-import { MessageType, isReliableMessage, createInput, createHash, createSync, createSyncRequest, createJoinRequest, createJoinAccept, createJoinReject, createStateSync, createPlayerJoined, createPlayerLeft, createPause, createResume, createPing, createPong, createLagReport, createDisconnectReport, createResumeCountdown, createDropPlayer } from './messages.js';
+import { encodeMessage, decodeMessage } from './encoding.js';
+import { MessageType, isReliableMessage, createInput, createHash, createSync, createSyncRequest, createJoinRequest, createJoinAccept, createJoinReject, createStateSync, createPlayerJoined, createPlayerLeft, createPause, createResume, createLagReport, createDisconnectReport, createResumeCountdown, createDropPlayer } from './messages.js';
 import { RollbackEngine } from './engine.js';
 
 const RATE_LIMIT_CLEANUP_INTERVAL_MS = 60000;
 const DEFAULT_LAG_REPORT_COOLDOWN_TICKS = 30;
-const RTT_SAMPLE_COUNT = 5;
 
 function generateRoomId() {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -40,46 +39,25 @@ export class Session {
 
         this._localPlayerId = options.localPlayerId ?? asPlayerId(this.transport.localPeerId);
         this.debug = this.config.debug;
+        this.inputPredictor = options.inputPredictor;
 
         this.playerManager = new Map();
         this.emittedJoinEvents = new Set();
         this.pendingHashMessages = [];
-        this.peerRttData = new Map();
         this.eventHandlers = new Map();
         this.joinRateLimiter = new Map();
         this.lagReports = new Map();
         this.lastHashBroadcastTick = asTick(-1);
         this.inputRedundancy = this.config.inputRedundancy;
+        this.inputSizeBytes = this.config.inputSizeBytes;
+        this.inputDelayTicks = this.config.baseInputDelayTicks;
+        this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.lastSyncRequestAtMs = 0;
+        this.syncRequestCooldownMs = 500;
+        this.rollbackPressure = 0;
 
-        this.engine = new RollbackEngine({
-            game: this.game,
-            localPlayerId: this._localPlayerId,
-            snapshotHistorySize: this.config.snapshotHistorySize,
-            maxSpeculationTicks: this.config.maxSpeculationTicks,
-            inputPredictor: options.inputPredictor,
-            onPlayerAddDuringResimulation: (playerId, tick) => {
-                if (this.emittedJoinEvents.has(playerId)) return;
-                const playerInfo = this.playerManager.get(playerId);
-                if (playerInfo) {
-                    this.emittedJoinEvents.add(playerId);
-                    this.emit('playerJoined', playerInfo);
-                }
-            },
-            onPlayerRemoveDuringResimulation: (playerId, tick) => {
-                const playerInfo = this.playerManager.get(playerId);
-                if (playerInfo) {
-                    this.emit('playerLeft', playerInfo);
-                }
-            },
-            onRollback: (restoreTick) => {
-                for (const playerId of this.emittedJoinEvents) {
-                    const playerInfo = this.playerManager.get(playerId);
-                    if (playerInfo && playerInfo.joinTick !== null && playerInfo.joinTick > restoreTick) {
-                        this.emittedJoinEvents.delete(playerId);
-                    }
-                }
-            },
-        });
+        this.engine = this.createEngine();
 
         this.playerManager.set(this._localPlayerId, {
             id: this._localPlayerId,
@@ -137,6 +115,108 @@ export class Session {
 
     get confirmedTick() {
         return this.engine.confirmedTick;
+    }
+
+    createEngine() {
+        return new RollbackEngine({
+            game: this.game,
+            localPlayerId: this._localPlayerId,
+            snapshotHistorySize: this.config.snapshotHistorySize,
+            maxSpeculationTicks: this.config.maxSpeculationTicks,
+            inputSizeBytes: this.config.inputSizeBytes,
+            inputPredictor: this.inputPredictor,
+            onPlayerAddDuringResimulation: (playerId, tick) => {
+                if (this.emittedJoinEvents.has(playerId)) return;
+                const playerInfo = this.playerManager.get(playerId);
+                if (playerInfo) {
+                    this.emittedJoinEvents.add(playerId);
+                    this.emit('playerJoined', playerInfo);
+                }
+            },
+            onPlayerRemoveDuringResimulation: (playerId, tick) => {
+                const playerInfo = this.playerManager.get(playerId);
+                if (playerInfo) {
+                    this.emit('playerLeft', playerInfo);
+                }
+            },
+            onRollback: (restoreTick) => {
+                for (const playerId of this.emittedJoinEvents) {
+                    const playerInfo = this.playerManager.get(playerId);
+                    if (playerInfo && playerInfo.joinTick !== null && playerInfo.joinTick > restoreTick) {
+                        this.emittedJoinEvents.delete(playerId);
+                    }
+                }
+            },
+        });
+    }
+
+    getJoinAcceptConfigPayload() {
+        return {
+            tickRate: this.config.tickRate,
+            maxPlayers: this.config.maxPlayers,
+            topology: this.config.topology,
+            snapshotHistorySize: this.config.snapshotHistorySize,
+            maxSpeculationTicks: this.config.maxSpeculationTicks,
+            hashInterval: this.config.hashInterval,
+            disconnectTimeout: this.config.disconnectTimeout,
+            desyncAuthority: this.config.desyncAuthority,
+            lagReportThreshold: this.config.lagReportThreshold,
+            inputRedundancy: this.config.inputRedundancy,
+            inputSizeBytes: this.config.inputSizeBytes,
+            baseInputDelayTicks: this.config.baseInputDelayTicks,
+            maxInputDelayTicks: this.config.maxInputDelayTicks,
+            adaptiveInputDelay: this.config.adaptiveInputDelay,
+            adaptiveDelayUpdateInterval: this.config.adaptiveDelayUpdateInterval,
+            jitterBufferMs: this.config.jitterBufferMs,
+            joinRateLimitRequests: this.config.joinRateLimitRequests,
+            joinRateLimitWindowMs: this.config.joinRateLimitWindowMs,
+        };
+    }
+
+    applyHostSessionConfig(hostConfig) {
+        if (!hostConfig || typeof hostConfig !== 'object') return;
+
+        const allowedKeys = [
+            'tickRate',
+            'maxPlayers',
+            'topology',
+            'snapshotHistorySize',
+            'maxSpeculationTicks',
+            'hashInterval',
+            'disconnectTimeout',
+            'desyncAuthority',
+            'lagReportThreshold',
+            'inputRedundancy',
+            'inputSizeBytes',
+            'baseInputDelayTicks',
+            'maxInputDelayTicks',
+            'adaptiveInputDelay',
+            'adaptiveDelayUpdateInterval',
+            'jitterBufferMs',
+            'joinRateLimitRequests',
+            'joinRateLimitWindowMs',
+        ];
+
+        const sanitized = {};
+        for (const key of allowedKeys) {
+            if (Object.prototype.hasOwnProperty.call(hostConfig, key)) {
+                sanitized[key] = hostConfig[key];
+            }
+        }
+
+        const merged = { ...this.config, ...sanitized };
+        validateSessionConfig(merged);
+
+        this.config = merged;
+        this.debug = this.config.debug;
+        this.inputRedundancy = this.config.inputRedundancy;
+        this.inputSizeBytes = this.config.inputSizeBytes;
+        this.inputDelayTicks = this.config.baseInputDelayTicks;
+        this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.rollbackPressure = 0;
+        this.pendingHashMessages = [];
+        this.engine = this.createEngine();
     }
 
     destroy() {
@@ -201,6 +281,10 @@ export class Session {
         this.playerManager.clear();
         this.emittedJoinEvents.clear();
         this.engine.reset();
+        this.inputDelayTicks = this.config.baseInputDelayTicks;
+        this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.rollbackPressure = 0;
 
         this.playerManager.set(this._localPlayerId, {
             id: this.localPlayerId,
@@ -219,6 +303,11 @@ export class Session {
     start() {
         if (!this._isHost) throw new Error('Only the host can start the game');
         if (this._state !== SessionState.Lobby) throw new Error('Can only start from lobby state');
+
+        this.inputDelayTicks = this.config.baseInputDelayTicks;
+        this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.rollbackPressure = 0;
 
         const startTick = asTick(0);
         for (const player of this.playerManager.values()) {
@@ -283,12 +372,11 @@ export class Session {
 
         if (this._localRole === PlayerRole.Player) {
             if (!localInput) throw new Error('Players must provide input');
-
-            this.engine.setLocalInput(currentTick, localInput);
-            this.broadcastInput(currentTick, localInput);
+            this.scheduleLocalInput(currentTick, localInput);
         }
 
         const result = this.engine.tick();
+        this.observeRollbackPressure(result);
 
         if (result.error) {
             this.emit('error', result.error, { source: ErrorSource.Engine, recoverable: true, details: { tick: result.tick } });
@@ -309,7 +397,31 @@ export class Session {
 
     requestSync() {
         if (this._isHost) return;
+        const now = Date.now();
+        if (now - this.lastSyncRequestAtMs < this.syncRequestCooldownMs) return;
+        this.lastSyncRequestAtMs = now;
         this.sendToHost(createSyncRequest(this.localPlayerId, this.engine.currentTick, this.engine.getCurrentHash()));
+    }
+
+    syncState() {
+        if (!this._isHost) return;
+        if (this._state !== SessionState.Playing && this._state !== SessionState.Paused) return;
+
+        const state = this.engine.getState();
+        for (const pt of state.playerTimeline) {
+            const p = this.playerManager.get(pt.playerId);
+            if (p) pt.name = p.name;
+        }
+        const syncMsg = createSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline);
+        this.broadcast(syncMsg, true);
+
+        // Keep host internals aligned with the same sync baseline it just sent.
+        this.engine.resetForSync(state.tick, state.playerTimeline);
+        this.pendingHashMessages = [];
+        this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.rollbackPressure = 0;
+        this.emit('synced', state.tick);
     }
 
     on(event, handler) {
@@ -399,6 +511,7 @@ export class Session {
                 break;
             case MessageType.Resume:
                 this.setState(SessionState.Playing);
+                if (!this._isHost) this.requestSync();
                 break;
             case MessageType.Ping:
                 this.transport.handlePing?.(peerId, message.timestamp);
@@ -472,6 +585,9 @@ export class Session {
     handleSyncMessage(message) {
         this.engine.setState(message.tick, message.state, message.playerTimeline);
         this.pendingHashMessages = [];
+        this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.rollbackPressure = 0;
 
         for (const entry of message.playerTimeline) {
             const connectionState = entry.leaveTick !== null ? PlayerConnectionState.Disconnected : PlayerConnectionState.Connected;
@@ -502,6 +618,8 @@ export class Session {
             this.setState(SessionState.Playing);
             this.emit('gameStart');
         }
+
+        this.emit('synced', message.tick);
     }
 
     handleSyncRequest(message) {
@@ -516,6 +634,10 @@ export class Session {
         this.broadcast(syncMsg, true);
         this.engine.resetForSync(state.tick, state.playerTimeline);
         this.pendingHashMessages = [];
+        this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.rollbackPressure = 0;
+        this.emit('synced', state.tick);
     }
 
     handleJoinRequest(peerId, message) {
@@ -535,7 +657,8 @@ export class Session {
         }
 
         const playerIds = connectedPlayers.map(p => ({ id: p.id, name: p.name || '' }));
-        this.transport.send(peerId, encodeMessage(createJoinAccept(playerId, this._roomId, { tickRate: this.config.tickRate, maxPlayers: this.config.maxPlayers }, playerIds)), true);
+        const joinConfig = this.getJoinAcceptConfigPayload();
+        this.transport.send(peerId, encodeMessage(createJoinAccept(playerId, this._roomId, joinConfig, playerIds)), true);
 
         const playerRole = message.role ?? PlayerRole.Player;
         const playerInfo = {
@@ -575,6 +698,22 @@ export class Session {
     }
 
     handleJoinAccept(message) {
+        if (message?.roomId) {
+            this._roomId = message.roomId;
+        }
+
+        try {
+            this.applyHostSessionConfig(message?.config);
+        } catch (error) {
+            this.setState(SessionState.Disconnected);
+            this.emit(
+                'error',
+                error instanceof Error ? error : new Error(String(error)),
+                { source: ErrorSource.Protocol, recoverable: false, details: { phase: 'joinAcceptConfig' } }
+            );
+            return;
+        }
+
         if (this._state === SessionState.Connecting) {
             this.setState(SessionState.Lobby);
         }
@@ -664,7 +803,6 @@ export class Session {
     }
 
     handlePeerDisconnect(peerId) {
-        this.peerRttData.delete(peerId);
         const playerId = asPlayerId(peerId);
         this.markPlayerDisconnected(playerId);
     }
@@ -755,17 +893,125 @@ export class Session {
     sendPing(peerId) {
         const timestamp = Date.now();
         this.transport.sendPing?.(peerId, timestamp);
-
-        let data = this.peerRttData.get(peerId);
-        if (!data) {
-            data = { pendingPings: new Map(), rtt: 0, samples: [] };
-            this.peerRttData.set(peerId, data);
-        }
-        data.pendingPings.set(timestamp, timestamp);
     }
 
     getRtt(peerId) {
-        return this.peerRttData.get(peerId)?.rtt ?? 0;
+        return this.transport.getConnectionMetrics?.(peerId)?.rtt ?? 0;
+    }
+
+    normalizeInput(input) {
+        const source = input instanceof Uint8Array ? input : new Uint8Array(input ?? []);
+        const normalized = new Uint8Array(this.inputSizeBytes);
+        normalized.set(source.subarray(0, this.inputSizeBytes));
+        return normalized;
+    }
+
+    cloneInput(input) {
+        const copy = new Uint8Array(input.length);
+        copy.set(input);
+        return copy;
+    }
+
+    updateAdaptiveInputDelay(currentTick) {
+        if (!this.config.adaptiveInputDelay) {
+            this.inputDelayTicks = this.config.baseInputDelayTicks;
+            return;
+        }
+
+        if (this.lastAdaptiveDelayUpdateTick >= 0 &&
+            currentTick - this.lastAdaptiveDelayUpdateTick < this.config.adaptiveDelayUpdateInterval) {
+            return;
+        }
+
+        this.lastAdaptiveDelayUpdateTick = currentTick;
+
+        const currentEngineTick = this.engine.currentTick;
+        let worstRttMs = 0;
+        let worstJitterMs = 0;
+        let worstInputLagTicks = 0;
+
+        for (const player of this.playerManager.values()) {
+            if (player.id === this.localPlayerId) continue;
+            if (player.role !== PlayerRole.Player) continue;
+            if (player.connectionState !== PlayerConnectionState.Connected) continue;
+
+            const confirmedTick = this.engine.getConfirmedTickForPlayer(player.id);
+            if (confirmedTick !== undefined) {
+                worstInputLagTicks = Math.max(worstInputLagTicks, Math.max(0, currentEngineTick - confirmedTick - 1));
+            }
+
+            const metrics = this.transport.getConnectionMetrics?.(playerIdToPeerId(player.id));
+            if (!metrics) continue;
+
+            worstRttMs = Math.max(worstRttMs, metrics.rtt || 0);
+            worstJitterMs = Math.max(worstJitterMs, metrics.jitter || 0);
+        }
+
+        const tickMs = 1000 / this.config.tickRate;
+        const rttDelay = Math.ceil(((worstRttMs * 0.5) + worstJitterMs + this.config.jitterBufferMs) / tickMs);
+        const cadenceDelay = Math.min(this.config.maxInputDelayTicks, worstInputLagTicks);
+        const rollbackDelay = Math.min(this.config.maxInputDelayTicks, Math.ceil(this.rollbackPressure / 3));
+        const targetDelay = Math.min(
+            this.config.maxInputDelayTicks,
+            Math.max(
+                this.config.baseInputDelayTicks,
+                rttDelay,
+                cadenceDelay,
+                rollbackDelay
+            )
+        );
+
+        const previousDelay = this.inputDelayTicks;
+        if (targetDelay > previousDelay) {
+            this.inputDelayTicks = targetDelay;
+        } else if (targetDelay < previousDelay) {
+            this.inputDelayTicks = Math.max(targetDelay, previousDelay - 1);
+        }
+
+        if (this.inputDelayTicks !== previousDelay) {
+            this.emit('inputDelayChanged', this.inputDelayTicks, {
+                worstRttMs,
+                worstJitterMs,
+                worstInputLagTicks,
+                rollbackPressure: this.rollbackPressure,
+                targetDelay,
+            });
+        }
+    }
+
+    observeRollbackPressure(result) {
+        // Exponential decay so transient spikes settle naturally.
+        this.rollbackPressure *= 0.9;
+
+        if (result?.rolledBack) {
+            const rollbackTicks = Math.max(1, result.rollbackTicks ?? 1);
+            this.rollbackPressure += Math.min(20, rollbackTicks);
+        } else {
+            this.rollbackPressure = Math.max(0, this.rollbackPressure - 0.05);
+        }
+    }
+
+    scheduleLocalInput(currentTick, localInput) {
+        this.updateAdaptiveInputDelay(currentTick);
+
+        const normalizedInput = this.normalizeInput(localInput);
+        const delayedTick = asTick(currentTick + this.inputDelayTicks);
+
+        if (!this.engine.getLocalInput(delayedTick)) {
+            this.engine.setLocalInput(delayedTick, normalizedInput);
+            this.broadcastInput(delayedTick, normalizedInput);
+        }
+
+        let simulatedInput = this.engine.getLocalInput(currentTick);
+        if (!simulatedInput) {
+            simulatedInput = this.cloneInput(this.lastSimulatedLocalInput);
+            this.engine.setLocalInput(currentTick, simulatedInput);
+            if (currentTick !== delayedTick) {
+                this.broadcastInput(currentTick, simulatedInput);
+            }
+        }
+
+        this.lastSimulatedLocalInput = this.cloneInput(simulatedInput);
     }
 
     broadcast(message, reliable) {

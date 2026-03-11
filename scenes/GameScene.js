@@ -7,6 +7,7 @@ import { Minimap } from '../game/Minimap.js';
 import { assetManager } from '../utils/AssetManager.js';
 import { HUD } from '../ui/HUD.js';
 import { WheelControl } from '../ui/WheelControl.js';
+import { SessionState } from '../netcode/index.js';
 
 let _buttons = [];
 function regBtn(x, y, w, h, id, cb) { _buttons.push({ x, y, w, h, id, cb }); }
@@ -33,6 +34,18 @@ export class GameScene {
         this.hud = new HUD();
         this.gameOverTimer = -1;
         this.spectateId = null;
+        this.simTickMs = 1000 / CONFIG.NETCODE.TICK_RATE;
+        this.maxCatchUpTicksPerFrame = Math.max(6, CONFIG.NETCODE.MAX_CATCH_UP_TICKS_PER_FRAME || 12);
+        this.simClockStartMs = 0;
+        this.simClockStartTick = 0;
+        this._hadRollbackThisUpdate = false;
+        this._awaitingSync = false;
+        this._lastSyncRequestAtMs = 0;
+        this._sessionSyncHandler = null;
+        this._autoPausedForHidden = false;
+        this._visibilityHandler = null;
+        this.renderShipState = new Map();
+        this.renderShips = new Map();
 
         // Wheel control scheme
         this.wheelControl = CONFIG.MOVEMENT.WHEEL_CONTROL_SCHEME ? new WheelControl() : null;
@@ -118,6 +131,28 @@ export class GameScene {
     onEnter() {
         _buttons = [];
         if (!this.session) return;
+        this.resetSimulationClock(this.session.currentTick);
+        this._autoPausedForHidden = false;
+        this._awaitingSync = false;
+        this._lastSyncRequestAtMs = 0;
+        this.renderShipState.clear();
+        this.renderShips.clear();
+
+        if (!this._visibilityHandler) {
+            this._visibilityHandler = () => this.onVisibilityChange();
+            document.addEventListener('visibilitychange', this._visibilityHandler);
+        }
+        if (!this._sessionSyncHandler) {
+            this._sessionSyncHandler = () => {
+                this._awaitingSync = false;
+                this._hadRollbackThisUpdate = false;
+                this.resetSimulationClock(this.session ? this.session.currentTick : 0);
+                this.renderShipState.clear();
+                this.renderShips.clear();
+                this.syncWheelHeadingToLocal();
+            };
+            this.session.on('synced', this._sessionSyncHandler);
+        }
         const local = this.worldState.players.get(this.worldState.localPlayerId);
         if (local) {
             this.camX = local.x;
@@ -137,6 +172,56 @@ export class GameScene {
             // Enable left-joystick suppression for the duration of this scene
             GameScene._suppressLeftJoystick = true;
         }
+    }
+
+    onVisibilityChange() {
+        if (!this.session) return;
+
+        if (document.visibilityState === 'hidden') {
+            if (this.session.isHost && this.session.state === SessionState.Playing) {
+                this._autoPausedForHidden = true;
+                try {
+                    this.session.pause();
+                } catch { }
+            }
+            return;
+        }
+
+        if (this.session.isHost) {
+            if (this._autoPausedForHidden && this.session.state === SessionState.Paused) {
+                this.session.syncState?.();
+                this.session.resume();
+            }
+            this._autoPausedForHidden = false;
+        } else if (this.session.state === SessionState.Playing || this.session.state === SessionState.Paused) {
+            this._awaitingSync = true;
+            this._lastSyncRequestAtMs = performance.now();
+            this.session.requestSync?.();
+        }
+
+        this.resetSimulationClock(this.session.currentTick);
+        this.syncWheelHeadingToLocal();
+    }
+
+    resetSimulationClock(currentTick = 0) {
+        this.simClockStartMs = performance.now();
+        this.simClockStartTick = currentTick;
+    }
+
+    syncWheelHeadingToLocal() {
+        if (!this.wheelControl) return;
+        const local = this.worldState.players.get(this.worldState.localPlayerId);
+        if (!local) return;
+        this.wheelControl.syncToHeading(local.heading);
+    }
+
+    getDesiredCurrentTick(nowMs) {
+        if (!this.simClockStartMs) {
+            this.resetSimulationClock(this.session ? this.session.currentTick : 0);
+        }
+        const elapsedMs = Math.max(0, nowMs - this.simClockStartMs);
+        const elapsedTicks = Math.floor(elapsedMs / this.simTickMs);
+        return this.simClockStartTick + elapsedTicks + 1;
     }
 
     updateLocalInput() {
@@ -204,11 +289,111 @@ export class GameScene {
         return inputArr;
     }
 
+    updateRenderShipState() {
+        const localId = this.worldState.localPlayerId;
+        const hadRollback = this._hadRollbackThisUpdate;
+
+        for (const [id, pdata] of this.worldState.players) {
+            const isLocal = id === localId;
+            const posAlpha = isLocal ? 0.85 : 0.24;
+            const headingAlpha = isLocal ? 0.85 : 0.42;
+
+            let smooth = this.renderShipState.get(id);
+            if (!smooth) {
+                smooth = { x: pdata.x, y: pdata.y, heading: pdata.heading, alive: pdata.alive };
+                this.renderShipState.set(id, smooth);
+                continue;
+            }
+
+            const dx = pdata.x - smooth.x;
+            const dy = pdata.y - smooth.y;
+            const dist = Math.hypot(dx, dy);
+            const rollbackJump = hadRollback && dist > 60;
+            const teleported = dist > 220 || rollbackJump || pdata.alive !== smooth.alive;
+
+            if (teleported) {
+                smooth.x = pdata.x;
+                smooth.y = pdata.y;
+                smooth.heading = pdata.heading;
+            } else {
+                let headingDiff = pdata.heading - smooth.heading;
+                if (headingDiff > 180) headingDiff -= 360;
+                if (headingDiff < -180) headingDiff += 360;
+
+                smooth.x += dx * posAlpha;
+                smooth.y += dy * posAlpha;
+
+                // Large heading corrections are usually rollback resimulation;
+                // snap immediately to avoid visible "turn back then forward" artifacts.
+                const snapThreshold = isLocal ? 60 : 35;
+                if (Math.abs(headingDiff) > snapThreshold || (hadRollback && !isLocal && Math.abs(headingDiff) > 18)) {
+                    smooth.heading = pdata.heading;
+                } else {
+                    smooth.heading += headingDiff * headingAlpha;
+                    if (smooth.heading >= 360) smooth.heading -= 360;
+                    if (smooth.heading < 0) smooth.heading += 360;
+                }
+            }
+
+            smooth.alive = pdata.alive;
+
+            if (isLocal && hadRollback && this.wheelControl && !this.wheelControl.active) {
+                this.wheelControl.syncToHeading(pdata.heading);
+            }
+        }
+
+        for (const id of this.renderShipState.keys()) {
+            if (!this.worldState.players.has(id)) {
+                this.renderShipState.delete(id);
+            }
+        }
+
+        for (const id of this.renderShips.keys()) {
+            if (!this.worldState.players.has(id)) {
+                this.renderShips.delete(id);
+            }
+        }
+    }
+
     onUpdate() {
         if (!this.session) return;
 
-        const input = this.updateLocalInput();
-        this.session.tick(input);
+        if (!this.session.isHost && this._awaitingSync) {
+            const nowMs = performance.now();
+            if (nowMs - this._lastSyncRequestAtMs > 600) {
+                this.session.requestSync?.();
+                this._lastSyncRequestAtMs = nowMs;
+            }
+            this.updateRenderShipState();
+            return;
+        }
+
+        const now = performance.now();
+        const desiredCurrentTick = this.getDesiredCurrentTick(now);
+        let ticksToProcess = Math.max(0, desiredCurrentTick - this.session.currentTick);
+
+        const dynamicMaxCatchUp = this.session?.isHost
+            ? Math.max(this.maxCatchUpTicksPerFrame, Math.floor(this.maxCatchUpTicksPerFrame * 1.5))
+            : this.maxCatchUpTicksPerFrame;
+
+        if (ticksToProcess > dynamicMaxCatchUp) {
+            const lagTicks = ticksToProcess - dynamicMaxCatchUp;
+            ticksToProcess = dynamicMaxCatchUp;
+
+            // If we're severely behind wall-clock, rebase to prevent endless saturation.
+            if (lagTicks > dynamicMaxCatchUp * 3) {
+                this.resetSimulationClock(this.session.currentTick + ticksToProcess);
+            }
+        }
+
+        this._hadRollbackThisUpdate = false;
+        for (let i = 0; i < ticksToProcess; i++) {
+            const input = this.updateLocalInput();
+            const result = this.session.tick(input);
+            if (result?.rolledBack) this._hadRollbackThisUpdate = true;
+        }
+
+        this.updateRenderShipState();
 
         // Update camera targeting smoothly
         let focusId = this.worldState.localPlayerId;
@@ -240,10 +425,13 @@ export class GameScene {
         }
 
         const focusPlayer = this.worldState.players.get(focusId);
+        const focusSmooth = this.renderShipState.get(focusId);
         this.focusId = focusId;
         if (focusPlayer) {
-            this.camX += (focusPlayer.x - this.camX) * 0.1;
-            this.camY += (focusPlayer.y - this.camY) * 0.1;
+            const targetCamX = focusSmooth ? focusSmooth.x : focusPlayer.x;
+            const targetCamY = focusSmooth ? focusSmooth.y : focusPlayer.y;
+            this.camX += (targetCamX - this.camX) * 0.1;
+            this.camY += (targetCamY - this.camY) * 0.1;
 
             // Camera bounds
             const padding = this.map.deathZoneDepth;
@@ -364,12 +552,18 @@ export class GameScene {
 
         // Render Ships
         for (const [id, pdata] of this.worldState.players) {
-            // Reconstruct a temporary ship class for rendering if it doesn't exist, else use WorldState instance
-            let ship = this.worldState.shipInstances.get(id);
+            const smooth = this.renderShipState.get(id);
+            const renderPdata = smooth
+                ? { ...pdata, x: smooth.x, y: smooth.y, heading: smooth.heading }
+                : pdata;
+
+            // Keep render-only ship objects separate from simulation ship instances.
+            let ship = this.renderShips.get(id);
             if (!ship) {
-                ship = new Ship(id, pdata); // Fallback
+                ship = new Ship(id, renderPdata);
+                this.renderShips.set(id, ship);
             } else {
-                ship.loadState(pdata);
+                ship.loadState(renderPdata);
             }
             const sessionPlayer = this.session?.playerManager.get(id);
             const playerName = sessionPlayer ? sessionPlayer.name : null;
@@ -499,6 +693,18 @@ export class GameScene {
     }
 
     onExit() {
+        if (this._visibilityHandler) {
+            document.removeEventListener('visibilitychange', this._visibilityHandler);
+            this._visibilityHandler = null;
+        }
+        if (this._sessionSyncHandler && this.session) {
+            this.session.off('synced', this._sessionSyncHandler);
+            this._sessionSyncHandler = null;
+        }
+        this.renderShipState.clear();
+        this.renderShips.clear();
+        this._hadRollbackThisUpdate = false;
+        this._awaitingSync = false;
         // Detach wheel touch listeners
         if (this.wheelControl) {
             this.wheelControl.detach();
