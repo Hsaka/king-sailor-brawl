@@ -311,3 +311,118 @@ test('Session resolves host player id independently of room id', async () => {
 
     session.destroy();
 });
+
+test('Session authorizes messages through configurable player-to-peer mapping', async () => {
+    const game = {
+        step() { },
+        serialize() { return new Uint8Array([0]); },
+        deserialize() { },
+        hashSerialized(bytes) { return bytes[0] ?? 0; },
+    };
+
+    const session = new Session({
+        game,
+        transport: new StubTransport('peer-local'),
+        localPlayerId: 'player-local',
+        playerIdToPeerId(playerId) {
+            if (playerId === 'remote-player') return 'remote-peer';
+            if (playerId === 'player-local') return 'peer-local';
+            return playerId;
+        },
+        config: {
+            inputSizeBytes: 3,
+            snapshotHistorySize: 32,
+            maxSpeculationTicks: 16,
+        },
+    });
+
+    await session.createRoom();
+    session.engine.addPlayer('remote-player', 0);
+
+    const trusted = encodeMessage(createInput('remote-player', [{ tick: 0, input: makeInput(0x10) }]));
+    session.handleMessage('remote-peer', trusted);
+
+    assert.equal(session.engine.getConfirmedTickForPlayer('remote-player'), 0);
+    session.destroy();
+});
+
+test('Session surfaces transport errors through session error events', async () => {
+    const transport = new StubTransport('host');
+    const session = new Session({
+        game: {
+            step() { },
+            serialize() { return new Uint8Array([0]); },
+            deserialize() { },
+            hashSerialized(bytes) { return bytes[0] ?? 0; },
+        },
+        transport,
+        config: {
+            inputSizeBytes: 3,
+            snapshotHistorySize: 32,
+            maxSpeculationTicks: 16,
+        },
+    });
+
+    const seen = [];
+    session.on('error', (error, metadata) => {
+        seen.push({ error, metadata });
+    });
+
+    transport.onError?.('peer-1', new Error('transport broke'), 'configSync');
+
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].metadata.source, 1);
+    assert.equal(seen[0].metadata.details.peerId, 'peer-1');
+    assert.equal(seen[0].metadata.details.phase, 'configSync');
+
+    session.destroy();
+});
+
+test('Session accepts host-relayed input messages in star topology', async () => {
+    const game = {
+        step() { },
+        serialize() { return new Uint8Array([0]); },
+        deserialize() { },
+        hashSerialized(bytes) { return bytes[0] ?? 0; },
+    };
+
+    const session = new Session({
+        game,
+        transport: new StubTransport('client-peer'),
+        config: {
+            topology: 1,
+            inputSizeBytes: 3,
+            snapshotHistorySize: 32,
+            maxSpeculationTicks: 16,
+        },
+    });
+
+    session.playerManager.set('host-peer', {
+        id: 'host-peer',
+        name: 'Host',
+        connectionState: 1,
+        joinTick: null,
+        leaveTick: null,
+        isHost: true,
+        role: 0,
+        rtt: 0,
+    });
+    session.playerManager.set('remote-peer', {
+        id: 'remote-peer',
+        name: 'Remote',
+        connectionState: 1,
+        joinTick: null,
+        leaveTick: null,
+        isHost: false,
+        role: 0,
+        rtt: 0,
+    });
+    session.engine.addPlayer('host-peer', 0);
+    session.engine.addPlayer('remote-peer', 0);
+
+    const relayed = encodeMessage(createInput('remote-peer', [{ tick: 0, input: makeInput(0x10) }]));
+    session.handleMessage('host-peer', relayed);
+
+    assert.equal(session.engine.getConfirmedTickForPlayer('remote-peer'), 0);
+    session.destroy();
+});

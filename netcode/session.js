@@ -40,6 +40,7 @@ export class Session {
         this._localPlayerId = options.localPlayerId ?? asPlayerId(this.transport.localPeerId);
         this.debug = this.config.debug;
         this.inputPredictor = options.inputPredictor;
+        this.playerIdToPeerId = options.playerIdToPeerId ?? playerIdToPeerId;
 
         this.playerManager = new Map();
         this.emittedJoinEvents = new Set();
@@ -74,6 +75,13 @@ export class Session {
         this.transport.onConnect = (peerId) => this.handlePeerConnect(peerId);
         this.transport.onDisconnect = (peerId) => this.handlePeerDisconnect(peerId);
         this.transport.onKeepalivePing = (peerId) => this.sendPing(peerId);
+        this.transport.onError = (peerId, error, phase) => {
+            this.emit(
+                'error',
+                error instanceof Error ? error : new Error(String(error)),
+                { source: ErrorSource.Transport, recoverable: true, details: { peerId, phase } }
+            );
+        };
 
         this._state = SessionState.Disconnected;
         this._isHost = false;
@@ -239,6 +247,7 @@ export class Session {
         this.transport.onMessage = null;
         this.transport.onConnect = null;
         this.transport.onDisconnect = null;
+        this.transport.onError = null;
     }
 
     async createRoom() {
@@ -1050,10 +1059,23 @@ export class Session {
     isAuthorizedMessagePeer(peerId, message) {
         switch (message.type) {
             case MessageType.Input:
+                if (this.playerIdToPeerId(message.playerId) === peerId) {
+                    return true;
+                }
+
+                // In star topology, non-host peers receive relayed inputs from the host.
+                if (!this._isHost && this.config.topology === Topology.Star) {
+                    const hostPeerId = this.getHostPlayerId();
+                    if (hostPeerId && hostPeerId === peerId) {
+                        return true;
+                    }
+                }
+
+                return false;
             case MessageType.Hash:
             case MessageType.SyncRequest:
             case MessageType.JoinRequest:
-                return message.playerId === peerId;
+                return this.playerIdToPeerId(message.playerId) === peerId;
             default:
                 return true;
         }
