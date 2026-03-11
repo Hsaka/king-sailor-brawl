@@ -30,8 +30,8 @@ globalThis.webkitAudioContext = globalThis.webkitAudioContext || globalThis.Audi
 const { WorldState } = await import('../game/WorldState.js');
 const { RollbackEngine } = await import('../netcode/engine.js');
 const { Session } = await import('../netcode/session.js');
-const { encodeMessage } = await import('../netcode/encoding.js');
-const { createInput } = await import('../netcode/messages.js');
+const { encodeMessage, decodeMessage } = await import('../netcode/encoding.js');
+const { MessageType, createInput } = await import('../netcode/messages.js');
 const { hashBytes } = await import('../netcode/hash.js');
 
 function makeInput(flags) {
@@ -452,7 +452,19 @@ test('Session accepts host-relayed input messages in star topology', async () =>
     session.destroy();
 });
 
-test('Session raises adaptive input delay immediately when a remote peer falls behind', async () => {
+test('Session batches pending local inputs into one outbound packet', async () => {
+    class CaptureTransport extends StubTransport {
+        constructor(localPeerId) {
+            super(localPeerId);
+            this.broadcasts = [];
+        }
+
+        broadcast(message) {
+            this.broadcasts.push(message);
+        }
+    }
+
+    const transport = new CaptureTransport('local-peer');
     const session = new Session({
         game: {
             step() { },
@@ -460,42 +472,32 @@ test('Session raises adaptive input delay immediately when a remote peer falls b
             deserialize() { },
             hashSerialized(bytes) { return bytes[0] ?? 0; },
         },
-        transport: new StubTransport('local-peer'),
+        transport,
         config: {
             inputSizeBytes: 3,
             snapshotHistorySize: 32,
             maxSpeculationTicks: 16,
-            adaptiveInputDelay: true,
-            adaptiveDelayUpdateInterval: 30,
-            baseInputDelayTicks: 2,
-            maxInputDelayTicks: 12,
-            tickRate: 60,
-            jitterBufferMs: 8,
+            inputRedundancy: 3,
+            adaptiveInputDelay: false,
+            baseInputDelayTicks: 0,
         },
     });
 
     try {
         await session.createRoom();
-        session.playerManager.set('remote-peer', {
-            id: 'remote-peer',
-            name: 'Remote',
-            connectionState: 1,
-            joinTick: null,
-            leaveTick: null,
-            isHost: false,
-            role: 0,
-            rtt: 0,
-        });
-        session.engine.addPlayer('remote-peer', 0);
+        session.setState(3);
+        session.engine._currentTick = 0;
 
-        session.inputDelayTicks = 2;
-        session.lastAdaptiveDelayUpdateTick = 39;
-        session.engine._currentTick = 40;
-        session.engine.inputBuffer.players.get('remote-peer').confirmedTick = 34;
+        session.scheduleLocalInput(0, makeInput(0x01));
+        session.engine._currentTick = 1;
+        session.scheduleLocalInput(1, makeInput(0x02));
+        session.flushPendingInputs();
 
-        session.updateAdaptiveInputDelay(40);
+        assert.equal(transport.broadcasts.length, 1);
 
-        assert.equal(session.inputDelayTicks, 7);
+        const message = decodeMessage(transport.broadcasts[0]);
+        assert.equal(message.type, MessageType.Input);
+        assert.deepEqual(message.inputs.map(entry => entry.tick), [0, 1]);
     } finally {
         session.destroy();
     }

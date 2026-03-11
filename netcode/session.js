@@ -54,6 +54,7 @@ export class Session {
         this.inputDelayTicks = this.config.baseInputDelayTicks;
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.pendingOutboundInputs = new Map();
         this.lastSyncRequestAtMs = 0;
         this.syncRequestCooldownMs = 500;
         this.rollbackPressure = 0;
@@ -227,6 +228,7 @@ export class Session {
         this.inputDelayTicks = this.config.baseInputDelayTicks;
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.pendingOutboundInputs = new Map();
         this.rollbackPressure = 0;
         this.pendingHashMessages = [];
         this.engine = this.createEngine();
@@ -298,6 +300,7 @@ export class Session {
         this.inputDelayTicks = this.config.baseInputDelayTicks;
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.pendingOutboundInputs.clear();
         this.rollbackPressure = 0;
 
         this.playerManager.set(this._localPlayerId, {
@@ -321,6 +324,7 @@ export class Session {
         this.inputDelayTicks = this.config.baseInputDelayTicks;
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
+        this.pendingOutboundInputs.clear();
         this.rollbackPressure = 0;
 
         const startTick = asTick(0);
@@ -434,6 +438,7 @@ export class Session {
         this.pendingHashMessages = [];
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.pendingOutboundInputs.clear();
         this.rollbackPressure = 0;
         this.emit('synced', state.tick);
     }
@@ -610,6 +615,7 @@ export class Session {
         this.pendingHashMessages = [];
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.pendingOutboundInputs.clear();
         this.rollbackPressure = 0;
 
         for (const entry of message.playerTimeline) {
@@ -659,6 +665,7 @@ export class Session {
         this.pendingHashMessages = [];
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
+        this.pendingOutboundInputs.clear();
         this.rollbackPressure = 0;
         this.emit('synced', state.tick);
     }
@@ -913,6 +920,36 @@ export class Session {
         this.broadcast(createInput(this.localPlayerId, inputs), false);
     }
 
+    queueOutboundInput(tick, input) {
+        this.pendingOutboundInputs.set(tick, this.cloneInput(input));
+    }
+
+    flushPendingInputs() {
+        if (this.pendingOutboundInputs.size === 0) return;
+
+        const sortedTicks = Array.from(this.pendingOutboundInputs.keys()).sort((a, b) => a - b);
+        const latestTick = sortedTicks[sortedTicks.length - 1];
+        const queuedTicks = new Set(sortedTicks);
+        const inputs = sortedTicks.map((tick) => ({
+            tick,
+            input: this.pendingOutboundInputs.get(tick),
+        }));
+
+        for (let i = 1; i < this.inputRedundancy; i++) {
+            const prevTick = asTick(latestTick - i);
+            if (prevTick < 0 || queuedTicks.has(prevTick)) continue;
+
+            const prevInput = this.engine.getLocalInput(prevTick);
+            if (prevInput) {
+                inputs.push({ tick: prevTick, input: prevInput });
+            }
+        }
+
+        inputs.sort((a, b) => a.tick - b.tick);
+        this.pendingOutboundInputs.clear();
+        this.broadcast(createInput(this.localPlayerId, inputs), false);
+    }
+
     sendPing(peerId) {
         const timestamp = Date.now();
         this.transport.sendPing?.(peerId, timestamp);
@@ -941,6 +978,13 @@ export class Session {
             return;
         }
 
+        if (this.lastAdaptiveDelayUpdateTick >= 0 &&
+            currentTick - this.lastAdaptiveDelayUpdateTick < this.config.adaptiveDelayUpdateInterval) {
+            return;
+        }
+
+        this.lastAdaptiveDelayUpdateTick = currentTick;
+
         const currentEngineTick = this.engine.currentTick;
         let worstRttMs = 0;
         let worstJitterMs = 0;
@@ -963,24 +1007,9 @@ export class Session {
             worstJitterMs = Math.max(worstJitterMs, metrics.jitter || 0);
         }
 
-        const immediateLagPressure = worstInputLagTicks > this.inputDelayTicks;
-        const immediateRollbackPressure = this.rollbackPressure >= 2;
-        const immediateJitterPressure = Math.ceil((worstJitterMs + this.config.jitterBufferMs) / (1000 / this.config.tickRate)) > this.inputDelayTicks;
-
-        if (!immediateLagPressure && !immediateRollbackPressure && !immediateJitterPressure &&
-            this.lastAdaptiveDelayUpdateTick >= 0 &&
-            currentTick - this.lastAdaptiveDelayUpdateTick < this.config.adaptiveDelayUpdateInterval) {
-            return;
-        }
-
-        this.lastAdaptiveDelayUpdateTick = currentTick;
-
         const tickMs = 1000 / this.config.tickRate;
         const rttDelay = Math.ceil(((worstRttMs * 0.5) + worstJitterMs + this.config.jitterBufferMs) / tickMs);
-        const cadenceDelay = Math.min(
-            this.config.maxInputDelayTicks,
-            worstInputLagTicks > 0 ? worstInputLagTicks + 2 : 0
-        );
+        const cadenceDelay = Math.min(this.config.maxInputDelayTicks, worstInputLagTicks);
         const rollbackDelay = Math.min(this.config.maxInputDelayTicks, Math.ceil(this.rollbackPressure / 3));
         const targetDelay = Math.min(
             this.config.maxInputDelayTicks,
@@ -1030,7 +1059,7 @@ export class Session {
 
         if (!this.engine.getLocalInput(delayedTick)) {
             this.engine.setLocalInput(delayedTick, normalizedInput);
-            this.broadcastInput(delayedTick, normalizedInput);
+            this.queueOutboundInput(delayedTick, normalizedInput);
         }
 
         let simulatedInput = this.engine.getLocalInput(currentTick);
@@ -1038,7 +1067,7 @@ export class Session {
             simulatedInput = this.cloneInput(this.lastSimulatedLocalInput);
             this.engine.setLocalInput(currentTick, simulatedInput);
             if (currentTick !== delayedTick) {
-                this.broadcastInput(currentTick, simulatedInput);
+                this.queueOutboundInput(currentTick, simulatedInput);
             }
         }
 

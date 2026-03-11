@@ -7,7 +7,7 @@ import { Minimap } from '../game/Minimap.js';
 import { assetManager } from '../utils/AssetManager.js';
 import { HUD } from '../ui/HUD.js';
 import { WheelControl } from '../ui/WheelControl.js';
-import { SessionState } from '../netcode/index.js';
+import { SessionState, PlayerRole, PlayerConnectionState } from '../netcode/index.js';
 
 let _buttons = [];
 function regBtn(x, y, w, h, id, cb) { _buttons.push({ x, y, w, h, id, cb }); }
@@ -224,6 +224,19 @@ export class GameScene {
         return this.simClockStartTick + elapsedTicks + 1;
     }
 
+    hasConnectedRemotePlayers() {
+        if (!this.session?.playerManager) return false;
+
+        for (const player of this.session.playerManager.values()) {
+            if (player.id === this.session.localPlayerId) continue;
+            if (player.role !== PlayerRole.Player) continue;
+            if (player.connectionState !== PlayerConnectionState.Connected) continue;
+            return true;
+        }
+
+        return false;
+    }
+
     updateLocalInput() {
         let input = 0;
 
@@ -300,69 +313,8 @@ export class GameScene {
 
             let smooth = this.renderShipState.get(id);
             if (!smooth) {
-                smooth = {
-                    x: pdata.x,
-                    y: pdata.y,
-                    heading: pdata.heading,
-                    alive: pdata.alive,
-                    simX: pdata.x,
-                    simY: pdata.y,
-                    simHeading: pdata.heading,
-                };
+                smooth = { x: pdata.x, y: pdata.y, heading: pdata.heading, alive: pdata.alive };
                 this.renderShipState.set(id, smooth);
-                continue;
-            }
-
-            if (isLocal) {
-                const prevSimX = smooth.simX ?? pdata.x;
-                const prevSimY = smooth.simY ?? pdata.y;
-                const prevSimHeading = smooth.simHeading ?? pdata.heading;
-
-                smooth.x += pdata.x - prevSimX;
-                smooth.y += pdata.y - prevSimY;
-
-                let simHeadingStep = pdata.heading - prevSimHeading;
-                if (simHeadingStep > 180) simHeadingStep -= 360;
-                if (simHeadingStep < -180) simHeadingStep += 360;
-                smooth.heading += simHeadingStep;
-                if (smooth.heading >= 360) smooth.heading -= 360;
-                if (smooth.heading < 0) smooth.heading += 360;
-
-                const correctionDx = pdata.x - smooth.x;
-                const correctionDy = pdata.y - smooth.y;
-                const correctionDist = Math.hypot(correctionDx, correctionDy);
-                const teleported = correctionDist > 140 || pdata.alive !== smooth.alive;
-
-                if (teleported) {
-                    smooth.x = pdata.x;
-                    smooth.y = pdata.y;
-                    smooth.heading = pdata.heading;
-                } else {
-                    const localCorrectionAlpha = hadRollback ? 0.45 : 0.22;
-                    smooth.x += correctionDx * localCorrectionAlpha;
-                    smooth.y += correctionDy * localCorrectionAlpha;
-
-                    let headingCorrection = pdata.heading - smooth.heading;
-                    if (headingCorrection > 180) headingCorrection -= 360;
-                    if (headingCorrection < -180) headingCorrection += 360;
-
-                    if (Math.abs(headingCorrection) > 75) {
-                        smooth.heading = pdata.heading;
-                    } else {
-                        smooth.heading += headingCorrection * (hadRollback ? 0.55 : 0.28);
-                        if (smooth.heading >= 360) smooth.heading -= 360;
-                        if (smooth.heading < 0) smooth.heading += 360;
-                    }
-                }
-
-                smooth.simX = pdata.x;
-                smooth.simY = pdata.y;
-                smooth.simHeading = pdata.heading;
-                smooth.alive = pdata.alive;
-
-                if (hadRollback && this.wheelControl && !this.wheelControl.active) {
-                    this.wheelControl.syncToHeading(pdata.heading);
-                }
                 continue;
             }
 
@@ -432,17 +384,21 @@ export class GameScene {
         const now = performance.now();
         const desiredCurrentTick = this.getDesiredCurrentTick(now);
         let ticksToProcess = Math.max(0, desiredCurrentTick - this.session.currentTick);
+        const hasRemotePlayers = this.hasConnectedRemotePlayers();
 
-        const dynamicMaxCatchUp = this.session?.isHost
-            ? Math.max(this.maxCatchUpTicksPerFrame, Math.floor(this.maxCatchUpTicksPerFrame * 1.5))
-            : this.maxCatchUpTicksPerFrame;
+        const dynamicMaxCatchUp = hasRemotePlayers
+            ? Math.max(CONFIG.NETCODE.TICK_RATE * 2, this.maxCatchUpTicksPerFrame * 8)
+            : (this.session?.isHost
+                ? Math.max(this.maxCatchUpTicksPerFrame, Math.floor(this.maxCatchUpTicksPerFrame * 1.5))
+                : this.maxCatchUpTicksPerFrame);
 
         if (ticksToProcess > dynamicMaxCatchUp) {
             const lagTicks = ticksToProcess - dynamicMaxCatchUp;
             ticksToProcess = dynamicMaxCatchUp;
 
-            // If we're severely behind wall-clock, rebase to prevent endless saturation.
-            if (lagTicks > dynamicMaxCatchUp * 3) {
+            // In networked matches we must preserve simulation time and keep catching up;
+            // rebasing the clock here only guarantees late inputs and rollback spikes.
+            if (!hasRemotePlayers && lagTicks > dynamicMaxCatchUp * 3) {
                 this.resetSimulationClock(this.session.currentTick + ticksToProcess);
             }
         }
@@ -452,6 +408,10 @@ export class GameScene {
             const input = this.updateLocalInput();
             const result = this.session.tick(input);
             if (result?.rolledBack) this._hadRollbackThisUpdate = true;
+        }
+
+        if (ticksToProcess > 0) {
+            this.session.flushPendingInputs?.();
         }
 
         this.updateRenderShipState();
