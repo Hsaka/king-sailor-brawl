@@ -941,13 +941,6 @@ export class Session {
             return;
         }
 
-        if (this.lastAdaptiveDelayUpdateTick >= 0 &&
-            currentTick - this.lastAdaptiveDelayUpdateTick < this.config.adaptiveDelayUpdateInterval) {
-            return;
-        }
-
-        this.lastAdaptiveDelayUpdateTick = currentTick;
-
         const currentEngineTick = this.engine.currentTick;
         let worstRttMs = 0;
         let worstJitterMs = 0;
@@ -970,9 +963,24 @@ export class Session {
             worstJitterMs = Math.max(worstJitterMs, metrics.jitter || 0);
         }
 
+        const immediateLagPressure = worstInputLagTicks > this.inputDelayTicks;
+        const immediateRollbackPressure = this.rollbackPressure >= 2;
+        const immediateJitterPressure = Math.ceil((worstJitterMs + this.config.jitterBufferMs) / (1000 / this.config.tickRate)) > this.inputDelayTicks;
+
+        if (!immediateLagPressure && !immediateRollbackPressure && !immediateJitterPressure &&
+            this.lastAdaptiveDelayUpdateTick >= 0 &&
+            currentTick - this.lastAdaptiveDelayUpdateTick < this.config.adaptiveDelayUpdateInterval) {
+            return;
+        }
+
+        this.lastAdaptiveDelayUpdateTick = currentTick;
+
         const tickMs = 1000 / this.config.tickRate;
         const rttDelay = Math.ceil(((worstRttMs * 0.5) + worstJitterMs + this.config.jitterBufferMs) / tickMs);
-        const cadenceDelay = Math.min(this.config.maxInputDelayTicks, worstInputLagTicks);
+        const cadenceDelay = Math.min(
+            this.config.maxInputDelayTicks,
+            worstInputLagTicks > 0 ? worstInputLagTicks + 2 : 0
+        );
         const rollbackDelay = Math.min(this.config.maxInputDelayTicks, Math.ceil(this.rollbackPressure / 3));
         const targetDelay = Math.min(
             this.config.maxInputDelayTicks,

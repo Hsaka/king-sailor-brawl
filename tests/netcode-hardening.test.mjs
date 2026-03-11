@@ -451,3 +451,52 @@ test('Session accepts host-relayed input messages in star topology', async () =>
     assert.equal(session.engine.getConfirmedTickForPlayer('remote-peer'), 0);
     session.destroy();
 });
+
+test('Session raises adaptive input delay immediately when a remote peer falls behind', async () => {
+    const session = new Session({
+        game: {
+            step() { },
+            serialize() { return new Uint8Array([0]); },
+            deserialize() { },
+            hashSerialized(bytes) { return bytes[0] ?? 0; },
+        },
+        transport: new StubTransport('local-peer'),
+        config: {
+            inputSizeBytes: 3,
+            snapshotHistorySize: 32,
+            maxSpeculationTicks: 16,
+            adaptiveInputDelay: true,
+            adaptiveDelayUpdateInterval: 30,
+            baseInputDelayTicks: 2,
+            maxInputDelayTicks: 12,
+            tickRate: 60,
+            jitterBufferMs: 8,
+        },
+    });
+
+    try {
+        await session.createRoom();
+        session.playerManager.set('remote-peer', {
+            id: 'remote-peer',
+            name: 'Remote',
+            connectionState: 1,
+            joinTick: null,
+            leaveTick: null,
+            isHost: false,
+            role: 0,
+            rtt: 0,
+        });
+        session.engine.addPlayer('remote-peer', 0);
+
+        session.inputDelayTicks = 2;
+        session.lastAdaptiveDelayUpdateTick = 39;
+        session.engine._currentTick = 40;
+        session.engine.inputBuffer.players.get('remote-peer').confirmedTick = 34;
+
+        session.updateAdaptiveInputDelay(40);
+
+        assert.equal(session.inputDelayTicks, 7);
+    } finally {
+        session.destroy();
+    }
+});
