@@ -156,6 +156,7 @@ export class LobbyScene {
                 // The host syncs the state which includes player slots.
                 this.transport = new PeerJSTransport(id);
                 this.transport.setPeerInstance(this.peer);
+                this.transport.setTrustedConfigPeerId(hostPeerId);
                 this.setupTransportListeners();
 
                 this.session = createSession({
@@ -214,12 +215,24 @@ export class LobbyScene {
 
     setupTransportListeners() {
         this.transport.onCustomData = (sender, data) => {
+            const hostPeerId = this.getHostPeerId();
+
             if (data.type === 'shipSelect') {
+                if (this.isHost) {
+                    if (sender !== data.peerId) return;
+                } else if (hostPeerId && sender !== hostPeerId) {
+                    return;
+                }
+
                 this.worldState.setPlayerShip(data.peerId, data.shipId);
                 if (this.isHost) {
                     this.broadcastShip(data.peerId, data.shipId);
                 }
             } else if (data.type === 'initialShips') {
+                if (this.isHost || (hostPeerId && sender !== hostPeerId)) {
+                    return;
+                }
+
                 for (const [pId, sId] of Object.entries(data.ships)) {
                     if (!this.worldState.players.has(pId)) {
                         this.worldState.addPlayer(pId, this.worldState.players.size);
@@ -242,9 +255,28 @@ export class LobbyScene {
         const msg = { __customData: true, type: 'shipSelect', peerId, shipId };
         if (this.isHost) {
             this.transport.broadcast(msg);
-        } else if (this.session && this.session.roomId) {
-            this.transport.send(this.session.roomId, msg, true);
+        } else {
+            const hostPeerId = this.getHostPeerId();
+            if (hostPeerId) {
+                this.transport.send(hostPeerId, msg, true);
+            }
         }
+    }
+
+    getHostPeerId() {
+        if (this.isHost) {
+            return this.peer ? this.peer.id : (this.session ? this.session.localPlayerId : null);
+        }
+
+        const hostFromSession = this.session?.getHostPlayerId?.();
+        if (hostFromSession) return hostFromSession;
+
+        const peers = this.transport?.connectedPeers;
+        if (peers && peers.size > 0) {
+            return peers.values().next().value;
+        }
+
+        return null;
     }
 
     changeShip(direction) {
@@ -322,7 +354,7 @@ export class LobbyScene {
 
         // Ensure absolute truth by cross-referencing with our actual peer connection ID and the room code we joined
         const myActualId = this.peer ? this.peer.id : this.session.localPlayerId;
-        const hostActualId = this.isHost ? myActualId : this.session.roomId;
+        const hostActualId = this.getHostPeerId();
 
         for (const [id, player] of this.session.players) {
             if (player.connectionState === PlayerConnectionState.Disconnected) continue;

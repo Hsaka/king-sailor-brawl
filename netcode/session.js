@@ -109,6 +109,11 @@ export class Session {
         return this._localRole;
     }
 
+    getHostPlayerId() {
+        const host = Array.from(this.playerManager.values()).find(player => player.isHost);
+        return host?.id ?? null;
+    }
+
     get currentTick() {
         return this.engine.currentTick;
     }
@@ -474,6 +479,15 @@ export class Session {
             message = decodeMessage(data);
         } catch (error) {
             this.emit('error', error, { source: ErrorSource.Protocol, recoverable: true, details: { peerId } });
+            return;
+        }
+
+        if (!this.isAuthorizedMessagePeer(peerId, message)) {
+            this.emit(
+                'error',
+                new Error(`Rejected spoofed message ${message.type} from ${peerId}`),
+                { source: ErrorSource.Protocol, recoverable: true, details: { peerId, messageType: message.type } }
+            );
             return;
         }
 
@@ -1030,6 +1044,18 @@ export class Session {
         if (peers.size > 0) {
             const hostPeerId = peers.values().next().value;
             this.transport.send(hostPeerId, encodeMessage(message), isReliableMessage(message));
+        }
+    }
+
+    isAuthorizedMessagePeer(peerId, message) {
+        switch (message.type) {
+            case MessageType.Input:
+            case MessageType.Hash:
+            case MessageType.SyncRequest:
+            case MessageType.JoinRequest:
+                return message.playerId === peerId;
+            default:
+                return true;
         }
     }
 

@@ -26,6 +26,7 @@ export class PeerJSTransport {
         this.onKeepalivePing = null;
 
         this._peer = null;
+        this.trustedConfigPeerId = config.trustedConfigPeerId ?? null;
     }
 
     get connectedPeers() {
@@ -42,6 +43,10 @@ export class PeerJSTransport {
 
         peer.on('call', (call) => {
         });
+    }
+
+    setTrustedConfigPeerId(peerId) {
+        this.trustedConfigPeerId = peerId;
     }
 
     handleIncomingConnection(conn) {
@@ -104,6 +109,10 @@ export class PeerJSTransport {
             this.recordPeerResponse(peerId);
 
             if (data && data.__customConfigSync) {
+                if (this.trustedConfigPeerId && peerId !== this.trustedConfigPeerId) {
+                    this.onError?.(peerId, new Error(`Rejected config sync from untrusted peer ${peerId}`), 'configSync');
+                    return;
+                }
                 Object.assign(CONFIG, data.config);
                 return;
             }

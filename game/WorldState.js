@@ -1,6 +1,7 @@
 import { Ship } from './Ship.js';
 import { ShipDefinitions } from './ShipDefinitions.js';
 import { CONFIG } from '../config.js';
+import { hashBytes } from '../netcode/hash.js';
 
 export class WorldState {
     constructor() {
@@ -691,21 +692,10 @@ export class WorldState {
     }
 
     hash() {
-        let h = this.seed;
-        for (const [id, p] of this.getSortedPlayerEntries()) {
-            h = ((h << 5) - h + Math.floor(p.x * 10)) | 0;
-            h = ((h << 5) - h + Math.floor(p.y * 10)) | 0;
-            h = ((h << 5) - h + Math.floor(p.health * 10)) | 0;
-            h = ((h << 5) - h + Math.floor((p.knockbackX || 0) * 10)) | 0;
-            h = ((h << 5) - h + Math.floor((p.knockbackY || 0) * 10)) | 0;
-            h = ((h << 5) - h + Math.floor((p.slowTimer || 0) * 10)) | 0;
-            h = ((h << 5) - h + (this.lastInput.get(id) || 0)) | 0;
-        }
-        for (const d of this.debris) {
-            h = ((h << 5) - h + Math.floor(d.x * 10)) | 0;
-            h = ((h << 5) - h + Math.floor(d.y * 10)) | 0;
-            h = ((h << 5) - h + Math.floor(d.life * 10)) | 0;
-        }
-        return h >>> 0;
+        return this.hashSerialized(this.serialize());
+    }
+
+    hashSerialized(state) {
+        return hashBytes(state);
     }
 }
