@@ -295,37 +295,13 @@ export class GameScene {
 
         for (const [id, pdata] of this.worldState.players) {
             const isLocal = id === localId;
-            const posAlpha = 0.24;
-            const headingAlpha = 0.42;
+            const posAlpha = isLocal ? 0.85 : 0.24;
+            const headingAlpha = isLocal ? 0.85 : 0.42;
 
             let smooth = this.renderShipState.get(id);
             if (!smooth) {
-                smooth = {
-                    x: pdata.x,
-                    y: pdata.y,
-                    heading: pdata.heading,
-                    alive: pdata.alive,
-                    prevX: pdata.x,
-                    prevY: pdata.y,
-                    prevHeading: pdata.heading,
-                };
+                smooth = { x: pdata.x, y: pdata.y, heading: pdata.heading, alive: pdata.alive };
                 this.renderShipState.set(id, smooth);
-                continue;
-            }
-
-            if (isLocal) {
-                const shouldSnap = hadRollback || pdata.alive !== smooth.alive;
-                smooth.prevX = shouldSnap ? pdata.x : smooth.x;
-                smooth.prevY = shouldSnap ? pdata.y : smooth.y;
-                smooth.prevHeading = shouldSnap ? pdata.heading : smooth.heading;
-                smooth.x = pdata.x;
-                smooth.y = pdata.y;
-                smooth.heading = pdata.heading;
-                smooth.alive = pdata.alive;
-
-                if (hadRollback && this.wheelControl && !this.wheelControl.active) {
-                    this.wheelControl.syncToHeading(pdata.heading);
-                }
                 continue;
             }
 
@@ -360,6 +336,10 @@ export class GameScene {
             }
 
             smooth.alive = pdata.alive;
+
+            if (isLocal && hadRollback && this.wheelControl && !this.wheelControl.active) {
+                this.wheelControl.syncToHeading(pdata.heading);
+            }
         }
 
         for (const id of this.renderShipState.keys()) {
@@ -373,41 +353,6 @@ export class GameScene {
                 this.renderShips.delete(id);
             }
         }
-    }
-
-    getRenderInterpolationAlpha() {
-        if (!this.session || !this.simClockStartMs) return 1;
-
-        const nowMs = performance.now();
-        const elapsedTicks = Math.max(0, (nowMs - this.simClockStartMs) / this.simTickMs);
-        const exactTick = this.simClockStartTick + elapsedTicks;
-        const currentStateTick = Math.max(0, this.session.currentTick - 1);
-
-        return Math.max(0, Math.min(1, exactTick - currentStateTick));
-    }
-
-    getRenderedShipState(id, pdata, alpha) {
-        const smooth = this.renderShipState.get(id);
-        if (!smooth) return pdata;
-
-        if (id !== this.worldState.localPlayerId || smooth.prevX === undefined) {
-            return { ...pdata, x: smooth.x, y: smooth.y, heading: smooth.heading };
-        }
-
-        let headingDiff = smooth.heading - smooth.prevHeading;
-        if (headingDiff > 180) headingDiff -= 360;
-        if (headingDiff < -180) headingDiff += 360;
-
-        let heading = smooth.prevHeading + headingDiff * alpha;
-        if (heading >= 360) heading -= 360;
-        if (heading < 0) heading += 360;
-
-        return {
-            ...pdata,
-            x: smooth.prevX + (smooth.x - smooth.prevX) * alpha,
-            y: smooth.prevY + (smooth.y - smooth.prevY) * alpha,
-            heading,
-        };
     }
 
     onUpdate() {
@@ -606,9 +551,11 @@ export class GameScene {
         c.fillRect(Math.min(sw, mx + mw - this.map.deathZoneDepth * s), 0, sw, sh);
 
         // Render Ships
-        const renderAlpha = this.getRenderInterpolationAlpha();
         for (const [id, pdata] of this.worldState.players) {
-            const renderPdata = this.getRenderedShipState(id, pdata, renderAlpha);
+            const smooth = this.renderShipState.get(id);
+            const renderPdata = smooth
+                ? { ...pdata, x: smooth.x, y: smooth.y, heading: smooth.heading }
+                : pdata;
 
             // Keep render-only ship objects separate from simulation ship instances.
             let ship = this.renderShips.get(id);

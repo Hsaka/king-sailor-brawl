@@ -138,6 +138,31 @@ test('WorldState hash tracks serialized gameplay fields', () => {
     assert.notEqual(cooldownHash, headingHash);
 });
 
+test('WorldState hash normalizes benign float representation differences', () => {
+    const world = createWorldStateWithPlayers(['p1']);
+    const baselineState = world.serialize();
+    const baselineHash = world.hashSerialized(baselineState);
+    const nearEquivalentState = new Uint8Array(baselineState);
+    const nearEquivalentView = new DataView(nearEquivalentState.buffer);
+
+    const playerIdLength = baselineState[12];
+    const playerOffset = 12 + 1 + playerIdLength;
+    const xOffset = playerOffset + 4 + 12;
+    const headingOffset = xOffset + 8;
+    const knockbackXOffset = headingOffset + 8;
+    const cooldownOffset = knockbackXOffset + 4 + 4 + 1 + 1 + 1 + 4 + 4;
+
+    nearEquivalentView.setFloat32(xOffset, nearEquivalentView.getFloat32(xOffset, true) + 0.004, true);
+    nearEquivalentView.setFloat32(headingOffset, nearEquivalentView.getFloat32(headingOffset, true) - 0.004, true);
+    nearEquivalentView.setFloat32(knockbackXOffset, -0, true);
+    nearEquivalentView.setFloat32(cooldownOffset, 0.004, true);
+
+    assert.equal(world.hashSerialized(nearEquivalentState), baselineHash);
+
+    nearEquivalentView.setFloat32(xOffset, nearEquivalentView.getFloat32(xOffset, true) + 0.02, true);
+    assert.notEqual(world.hashSerialized(nearEquivalentState), baselineHash);
+});
+
 test('RollbackEngine converges after delayed remote inputs', () => {
     const worldA = new DeterministicRollbackGame(['p1', 'p2']);
     const worldB = new DeterministicRollbackGame(['p1', 'p2']);

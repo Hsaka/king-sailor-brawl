@@ -1,7 +1,9 @@
 import { Ship } from './Ship.js';
 import { ShipDefinitions } from './ShipDefinitions.js';
 import { CONFIG } from '../config.js';
-import { hashBytes } from '../netcode/hash.js';
+
+const HASH_FLOAT_SCALE = 100;
+const HASH_TEXT_ENCODER = new TextEncoder();
 
 export class WorldState {
     constructor() {
@@ -123,6 +125,96 @@ export class WorldState {
         this.players.delete(id);
         this.shipInstances.delete(id);
         this.lastInput.delete(id);
+    }
+
+    hashMixInt(hash, value) {
+        let next = hash >>> 0;
+        let normalized = Number.isFinite(value) ? Math.trunc(value) : 0;
+        normalized |= 0;
+
+        next ^= normalized & 0xFF;
+        next = Math.imul(next, 0x01000193) >>> 0;
+        next ^= (normalized >>> 8) & 0xFF;
+        next = Math.imul(next, 0x01000193) >>> 0;
+        next ^= (normalized >>> 16) & 0xFF;
+        next = Math.imul(next, 0x01000193) >>> 0;
+        next ^= (normalized >>> 24) & 0xFF;
+        next = Math.imul(next, 0x01000193) >>> 0;
+
+        return next >>> 0;
+    }
+
+    hashMixBytes(hash, bytes) {
+        let next = hash >>> 0;
+        for (let i = 0; i < bytes.length; i++) {
+            next ^= bytes[i];
+            next = Math.imul(next, 0x01000193) >>> 0;
+        }
+        return next >>> 0;
+    }
+
+    hashMixString(hash, value) {
+        return this.hashMixBytes(hash, HASH_TEXT_ENCODER.encode(value));
+    }
+
+    quantizeHashFloat(value, scale = HASH_FLOAT_SCALE) {
+        const normalized = Number.isFinite(value) ? value : 0;
+        return Math.round((Object.is(normalized, -0) ? 0 : normalized) * scale);
+    }
+
+    hashPlayerState(hash, id, player, lastInput) {
+        let next = hash;
+        next = this.hashMixString(next, id);
+        next = this.hashMixInt(next, player.slot);
+        next = this.hashMixString(next, player.shipId);
+        next = this.hashMixInt(next, this.quantizeHashFloat(player.x));
+        next = this.hashMixInt(next, this.quantizeHashFloat(player.y));
+        next = this.hashMixInt(next, this.quantizeHashFloat(player.heading));
+        next = this.hashMixInt(next, this.quantizeHashFloat(player.health));
+        next = this.hashMixInt(next, this.quantizeHashFloat(player.knockbackX || 0));
+        next = this.hashMixInt(next, this.quantizeHashFloat(player.knockbackY || 0));
+        next = this.hashMixInt(next, player.speedTier);
+        next = this.hashMixInt(next, player.alive ? 1 : 0);
+        next = this.hashMixInt(next, player.isBot ? 1 : 0);
+        next = this.hashMixInt(next, this.quantizeHashFloat(player.invincibilityTimer || 0));
+        next = this.hashMixInt(next, this.quantizeHashFloat(player.slowTimer || 0));
+        for (let i = 0; i < 5; i++) {
+            next = this.hashMixInt(next, this.quantizeHashFloat(player.cooldowns?.[i] || 0));
+        }
+        next = this.hashMixInt(next, lastInput || 0);
+        return next >>> 0;
+    }
+
+    hashDebrisState(hash, debris) {
+        let next = hash;
+        next = this.hashMixInt(next, this.quantizeHashFloat(debris.x));
+        next = this.hashMixInt(next, this.quantizeHashFloat(debris.y));
+        next = this.hashMixInt(next, this.quantizeHashFloat(debris.vx));
+        next = this.hashMixInt(next, this.quantizeHashFloat(debris.vy));
+        next = this.hashMixInt(next, this.quantizeHashFloat(debris.life));
+        next = this.hashMixInt(next, this.quantizeHashFloat(debris.damage));
+        next = this.hashMixInt(next, this.quantizeHashFloat(debris.radius));
+        next = this.hashMixInt(next, this.quantizeHashFloat(debris.duration || 0));
+        next = this.hashMixString(next, debris.type || 'damage');
+        next = this.hashMixString(next, debris.spriteKey || '');
+        return next >>> 0;
+    }
+
+    hashStateRecords(playerEntries, debrisEntries, seed) {
+        let hash = 0x811c9dc5;
+        hash = this.hashMixInt(hash, seed);
+        hash = this.hashMixInt(hash, playerEntries.length);
+        hash = this.hashMixInt(hash, debrisEntries.length);
+
+        for (const [id, player, lastInput] of playerEntries) {
+            hash = this.hashPlayerState(hash, id, player, lastInput);
+        }
+
+        for (const debris of debrisEntries) {
+            hash = this.hashDebrisState(hash, debris);
+        }
+
+        return hash >>> 0;
     }
 
     serialize() {
@@ -692,10 +784,92 @@ export class WorldState {
     }
 
     hash() {
-        return this.hashSerialized(this.serialize());
+        const playerEntries = this.getSortedPlayerEntries().map(([id, player]) => [id, player, this.lastInput.get(id) || 0]);
+        return this.hashStateRecords(playerEntries, this.debris, this.seed);
     }
 
     hashSerialized(state) {
-        return hashBytes(state);
+        const view = new DataView(state.buffer, state.byteOffset, state.byteLength);
+        const uint8View = new Uint8Array(state.buffer, state.byteOffset, state.byteLength);
+        const decoder = new TextDecoder();
+        const count = view.getUint32(0, true);
+        const seed = view.getUint32(4, true);
+        const debrisCount = view.getUint32(8, true);
+        let offset = 12;
+        const playerEntries = [];
+        const debrisEntries = [];
+
+        for (let i = 0; i < count; i++) {
+            const idLen = view.getUint8(offset); offset += 1;
+            const id = decoder.decode(uint8View.subarray(offset, offset + idLen)); offset += idLen;
+            const slot = view.getUint32(offset, true); offset += 4;
+            const shipId = decoder.decode(uint8View.subarray(offset, offset + 12)).trim(); offset += 12;
+            const x = view.getFloat32(offset, true); offset += 4;
+            const y = view.getFloat32(offset, true); offset += 4;
+            const heading = view.getFloat32(offset, true); offset += 4;
+            const health = view.getFloat32(offset, true); offset += 4;
+            const knockbackX = view.getFloat32(offset, true); offset += 4;
+            const knockbackY = view.getFloat32(offset, true); offset += 4;
+            const speedTier = view.getUint8(offset); offset += 1;
+            const alive = view.getUint8(offset) === 1; offset += 1;
+            const isBot = view.getUint8(offset) === 1; offset += 1;
+            const invincibilityTimer = view.getFloat32(offset, true); offset += 4;
+            const slowTimer = view.getFloat32(offset, true); offset += 4;
+            const cooldowns = [
+                view.getFloat32(offset, true),
+                view.getFloat32(offset + 4, true),
+                view.getFloat32(offset + 8, true),
+                view.getFloat32(offset + 12, true),
+                view.getFloat32(offset + 16, true),
+            ];
+            offset += 20;
+            const lastInput = view.getUint32(offset, true); offset += 4;
+
+            playerEntries.push([id, {
+                slot,
+                shipId,
+                x,
+                y,
+                heading,
+                health,
+                knockbackX,
+                knockbackY,
+                speedTier,
+                alive,
+                isBot,
+                invincibilityTimer,
+                slowTimer,
+                cooldowns,
+            }, lastInput]);
+        }
+
+        for (let i = 0; i < debrisCount; i++) {
+            const x = view.getFloat32(offset, true); offset += 4;
+            const y = view.getFloat32(offset, true); offset += 4;
+            const vx = view.getFloat32(offset, true); offset += 4;
+            const vy = view.getFloat32(offset, true); offset += 4;
+            const life = view.getFloat32(offset, true); offset += 4;
+            const damage = view.getFloat32(offset, true); offset += 4;
+            const radius = view.getFloat32(offset, true); offset += 4;
+            const duration = view.getFloat32(offset, true); offset += 4;
+            const flag = view.getUint8(offset); offset += 1;
+            const isBomb = (flag & 128) !== 0;
+            const type = this.BOMB_TYPES[flag & 0x7F] || 'damage';
+
+            debrisEntries.push({
+                x,
+                y,
+                vx,
+                vy,
+                life,
+                damage,
+                radius,
+                duration,
+                type,
+                spriteKey: isBomb ? 'bomb' : 'debris',
+            });
+        }
+
+        return this.hashStateRecords(playerEntries, debrisEntries, seed);
     }
 }
