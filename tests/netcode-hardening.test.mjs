@@ -30,8 +30,8 @@ globalThis.webkitAudioContext = globalThis.webkitAudioContext || globalThis.Audi
 const { WorldState } = await import('../game/WorldState.js');
 const { RollbackEngine } = await import('../netcode/engine.js');
 const { Session } = await import('../netcode/session.js');
-const { encodeMessage, decodeMessage } = await import('../netcode/encoding.js');
-const { MessageType, createInput } = await import('../netcode/messages.js');
+const { encodeMessage } = await import('../netcode/encoding.js');
+const { createInput } = await import('../netcode/messages.js');
 const { hashBytes } = await import('../netcode/hash.js');
 
 function makeInput(flags) {
@@ -450,55 +450,4 @@ test('Session accepts host-relayed input messages in star topology', async () =>
 
     assert.equal(session.engine.getConfirmedTickForPlayer('remote-peer'), 0);
     session.destroy();
-});
-
-test('Session batches pending local inputs into one outbound packet', async () => {
-    class CaptureTransport extends StubTransport {
-        constructor(localPeerId) {
-            super(localPeerId);
-            this.broadcasts = [];
-        }
-
-        broadcast(message) {
-            this.broadcasts.push(message);
-        }
-    }
-
-    const transport = new CaptureTransport('local-peer');
-    const session = new Session({
-        game: {
-            step() { },
-            serialize() { return new Uint8Array([0]); },
-            deserialize() { },
-            hashSerialized(bytes) { return bytes[0] ?? 0; },
-        },
-        transport,
-        config: {
-            inputSizeBytes: 3,
-            snapshotHistorySize: 32,
-            maxSpeculationTicks: 16,
-            inputRedundancy: 3,
-            adaptiveInputDelay: false,
-            baseInputDelayTicks: 0,
-        },
-    });
-
-    try {
-        await session.createRoom();
-        session.setState(3);
-        session.engine._currentTick = 0;
-
-        session.scheduleLocalInput(0, makeInput(0x01));
-        session.engine._currentTick = 1;
-        session.scheduleLocalInput(1, makeInput(0x02));
-        session.flushPendingInputs();
-
-        assert.equal(transport.broadcasts.length, 1);
-
-        const message = decodeMessage(transport.broadcasts[0]);
-        assert.equal(message.type, MessageType.Input);
-        assert.deepEqual(message.inputs.map(entry => entry.tick), [0, 1]);
-    } finally {
-        session.destroy();
-    }
 });

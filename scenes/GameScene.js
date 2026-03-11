@@ -44,6 +44,10 @@ export class GameScene {
         this._sessionSyncHandler = null;
         this._autoPausedForHidden = false;
         this._visibilityHandler = null;
+        this._networkStepTimer = null;
+        this._lastNetworkPumpMs = 0;
+        this._networkAccumulatorMs = 0;
+        this._hadRollbackSinceVisualUpdate = false;
         this.renderShipState = new Map();
         this.renderShips = new Map();
 
@@ -146,7 +150,9 @@ export class GameScene {
             this._sessionSyncHandler = () => {
                 this._awaitingSync = false;
                 this._hadRollbackThisUpdate = false;
+                this._hadRollbackSinceVisualUpdate = false;
                 this.resetSimulationClock(this.session ? this.session.currentTick : 0);
+                this.resetNetworkSimulationClock();
                 this.renderShipState.clear();
                 this.renderShips.clear();
                 this.syncWheelHeadingToLocal();
@@ -172,6 +178,8 @@ export class GameScene {
             // Enable left-joystick suppression for the duration of this scene
             GameScene._suppressLeftJoystick = true;
         }
+
+        this.updateNetworkSimulationMode();
     }
 
     onVisibilityChange() {
@@ -200,12 +208,18 @@ export class GameScene {
         }
 
         this.resetSimulationClock(this.session.currentTick);
+        this.resetNetworkSimulationClock();
         this.syncWheelHeadingToLocal();
     }
 
     resetSimulationClock(currentTick = 0) {
         this.simClockStartMs = performance.now();
         this.simClockStartTick = currentTick;
+    }
+
+    resetNetworkSimulationClock() {
+        this._lastNetworkPumpMs = performance.now();
+        this._networkAccumulatorMs = 0;
     }
 
     syncWheelHeadingToLocal() {
@@ -235,6 +249,63 @@ export class GameScene {
         }
 
         return false;
+    }
+
+    shouldUseNetworkStepTimer() {
+        return this.hasConnectedRemotePlayers();
+    }
+
+    startNetworkSimulationLoop() {
+        if (this._networkStepTimer || !this.shouldUseNetworkStepTimer()) return;
+        this.resetNetworkSimulationClock();
+        this._networkStepTimer = setInterval(() => this.runNetworkSimulationPump(), Math.max(4, Math.floor(this.simTickMs / 2)));
+    }
+
+    stopNetworkSimulationLoop() {
+        if (!this._networkStepTimer) return;
+        clearInterval(this._networkStepTimer);
+        this._networkStepTimer = null;
+        this._networkAccumulatorMs = 0;
+    }
+
+    updateNetworkSimulationMode() {
+        if (this.shouldUseNetworkStepTimer()) {
+            this.startNetworkSimulationLoop();
+        } else {
+            this.stopNetworkSimulationLoop();
+        }
+    }
+
+    runNetworkSimulationPump() {
+        if (!this.session || !this.shouldUseNetworkStepTimer()) return;
+
+        if (this.session.state !== SessionState.Playing) {
+            this.resetNetworkSimulationClock();
+            return;
+        }
+
+        if (!this.session.isHost && this._awaitingSync) {
+            this.resetNetworkSimulationClock();
+            return;
+        }
+
+        const nowMs = performance.now();
+        const elapsedMs = Math.max(0, Math.min(250, nowMs - this._lastNetworkPumpMs));
+        this._lastNetworkPumpMs = nowMs;
+        this._networkAccumulatorMs += elapsedMs;
+
+        let steps = 0;
+        const maxStepsPerPump = Math.max(8, this.maxCatchUpTicksPerFrame);
+
+        while (this._networkAccumulatorMs >= this.simTickMs && steps < maxStepsPerPump) {
+            const input = this.updateLocalInput();
+            const result = this.session.tick(input);
+            if (result?.rolledBack) {
+                this._hadRollbackSinceVisualUpdate = true;
+            }
+            this._networkAccumulatorMs -= this.simTickMs;
+            steps++;
+        }
     }
 
     updateLocalInput() {
@@ -370,6 +441,7 @@ export class GameScene {
 
     onUpdate() {
         if (!this.session) return;
+        this.updateNetworkSimulationMode();
 
         if (!this.session.isHost && this._awaitingSync) {
             const nowMs = performance.now();
@@ -377,41 +449,40 @@ export class GameScene {
                 this.session.requestSync?.();
                 this._lastSyncRequestAtMs = nowMs;
             }
+            this._hadRollbackThisUpdate = this._hadRollbackSinceVisualUpdate;
+            this._hadRollbackSinceVisualUpdate = false;
             this.updateRenderShipState();
             return;
         }
 
-        const now = performance.now();
-        const desiredCurrentTick = this.getDesiredCurrentTick(now);
-        let ticksToProcess = Math.max(0, desiredCurrentTick - this.session.currentTick);
-        const hasRemotePlayers = this.hasConnectedRemotePlayers();
+        if (this.shouldUseNetworkStepTimer()) {
+            this._hadRollbackThisUpdate = this._hadRollbackSinceVisualUpdate;
+            this._hadRollbackSinceVisualUpdate = false;
+        } else {
+            const now = performance.now();
+            const desiredCurrentTick = this.getDesiredCurrentTick(now);
+            let ticksToProcess = Math.max(0, desiredCurrentTick - this.session.currentTick);
 
-        const dynamicMaxCatchUp = hasRemotePlayers
-            ? Math.max(CONFIG.NETCODE.TICK_RATE * 2, this.maxCatchUpTicksPerFrame * 8)
-            : (this.session?.isHost
+            const dynamicMaxCatchUp = this.session?.isHost
                 ? Math.max(this.maxCatchUpTicksPerFrame, Math.floor(this.maxCatchUpTicksPerFrame * 1.5))
-                : this.maxCatchUpTicksPerFrame);
+                : this.maxCatchUpTicksPerFrame;
 
-        if (ticksToProcess > dynamicMaxCatchUp) {
-            const lagTicks = ticksToProcess - dynamicMaxCatchUp;
-            ticksToProcess = dynamicMaxCatchUp;
+            if (ticksToProcess > dynamicMaxCatchUp) {
+                const lagTicks = ticksToProcess - dynamicMaxCatchUp;
+                ticksToProcess = dynamicMaxCatchUp;
 
-            // In networked matches we must preserve simulation time and keep catching up;
-            // rebasing the clock here only guarantees late inputs and rollback spikes.
-            if (!hasRemotePlayers && lagTicks > dynamicMaxCatchUp * 3) {
-                this.resetSimulationClock(this.session.currentTick + ticksToProcess);
+                // If we're severely behind wall-clock, rebase to prevent endless saturation.
+                if (lagTicks > dynamicMaxCatchUp * 3) {
+                    this.resetSimulationClock(this.session.currentTick + ticksToProcess);
+                }
             }
-        }
 
-        this._hadRollbackThisUpdate = false;
-        for (let i = 0; i < ticksToProcess; i++) {
-            const input = this.updateLocalInput();
-            const result = this.session.tick(input);
-            if (result?.rolledBack) this._hadRollbackThisUpdate = true;
-        }
-
-        if (ticksToProcess > 0) {
-            this.session.flushPendingInputs?.();
+            this._hadRollbackThisUpdate = false;
+            for (let i = 0; i < ticksToProcess; i++) {
+                const input = this.updateLocalInput();
+                const result = this.session.tick(input);
+                if (result?.rolledBack) this._hadRollbackThisUpdate = true;
+            }
         }
 
         this.updateRenderShipState();
@@ -722,9 +793,11 @@ export class GameScene {
             this.session.off('synced', this._sessionSyncHandler);
             this._sessionSyncHandler = null;
         }
+        this.stopNetworkSimulationLoop();
         this.renderShipState.clear();
         this.renderShips.clear();
         this._hadRollbackThisUpdate = false;
+        this._hadRollbackSinceVisualUpdate = false;
         this._awaitingSync = false;
         // Detach wheel touch listeners
         if (this.wheelControl) {
