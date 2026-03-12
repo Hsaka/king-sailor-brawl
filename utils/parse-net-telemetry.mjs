@@ -100,6 +100,7 @@ function main() {
     const syncRequests = events.filter((e) => e.type === 'sync_request');
     const catchUpEvents = events.filter((e) => e.type === 'catchup_clamped');
     const renderSnapEvents = events.filter((e) => e.type === 'render_snap');
+    const syncStateDiffEvents = events.filter((e) => e.type === 'sync_state_diff');
 
     const maxWorstBehind = activeFrames.reduce((m, e) => Math.max(m, safeNumber(e.worstTicksBehind)), 0);
     const maxRttMs = activeFrames.reduce((m, e) => Math.max(m, safeNumber(e.maxRttMs)), 0);
@@ -130,6 +131,7 @@ function main() {
     console.log(`  stalledTicks events: ${stallEvents.length} (stalledTicks total from frames: ${totalStalledTicks})`);
     console.log(`  syncRequests: ${syncRequests.length}, synced: ${syncedEvents.length}, desync: ${desyncEvents.length}`);
     console.log(`  catchUpClamped events: ${catchUpEvents.length}, renderSnap events: ${renderSnapEvents.length}`);
+    console.log(`  syncStateDiff events: ${syncStateDiffEvents.length}`);
     console.log('');
     console.log('Maxima');
     console.log(`  maxWorstBehindTicks: ${maxWorstBehind}`);
@@ -142,6 +144,50 @@ function main() {
     console.log('Event Type Counts');
     for (const [type, count] of sortedCounts) {
         console.log(`  ${type}: ${count}`);
+    }
+    console.log('');
+
+    const aggregateFieldCounts = {};
+    for (const ev of syncStateDiffEvents) {
+        const fields = ev.fieldCounts || {};
+        for (const [k, v] of Object.entries(fields)) {
+            aggregateFieldCounts[k] = (aggregateFieldCounts[k] || 0) + safeNumber(v);
+        }
+    }
+    const sortedFieldCounts = Object.entries(aggregateFieldCounts).sort((a, b) => b[1] - a[1]);
+
+    console.log('Sync State Diff Summary');
+    if (syncStateDiffEvents.length === 0) {
+        console.log('  none');
+    } else {
+        console.log(`  samples: ${syncStateDiffEvents.length}`);
+        if (sortedFieldCounts.length) {
+            console.log('  fieldDriftTotals:');
+            for (const [field, count] of sortedFieldCounts) {
+                console.log(`    ${field}: ${count}`);
+            }
+        }
+
+        const topDiffs = [...syncStateDiffEvents]
+            .sort((a, b) => safeNumber(b.changedPlayerCount) - safeNumber(a.changedPlayerCount))
+            .slice(0, 5);
+        console.log('  topSyncDiffs:');
+        for (const d of topDiffs) {
+            const topPlayers = Array.isArray(d.topChangedPlayers) ? d.topChangedPlayers : [];
+            const playerSummary = topPlayers
+                .slice(0, 3)
+                .map((p) => `${(p.id || '?').slice(0, 8)}:pos${safeNumber(p.posDist).toFixed(2)} hp${safeNumber(p.healthDiff).toFixed(2)} kb${safeNumber(p.knockbackDiff).toFixed(2)}`)
+                .join(' | ');
+            console.log(
+                `    tick=${d.tick} snapshot=${d.snapshotTick}` +
+                ` changedPlayers=${safeNumber(d.changedPlayerCount)}` +
+                ` localHash=${d.localHashAtSnapshotTick ?? 'n/a'}` +
+                ` syncHash=${d.syncHash ?? 'n/a'}`
+            );
+            if (playerSummary) {
+                console.log(`      players: ${playerSummary}`);
+            }
+        }
     }
     console.log('');
 
@@ -168,4 +214,3 @@ function main() {
 }
 
 main();
-

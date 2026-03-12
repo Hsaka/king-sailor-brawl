@@ -583,6 +583,27 @@ export class Session {
     }
 
     handleSyncMessage(message) {
+        // Diagnostics hook: expose local vs incoming sync snapshot bytes at the
+        // same snapshot tick (message.tick - 1) for higher-level telemetry.
+        const snapshotTick = asTick(message.tick - 1);
+        const localSnapshot = this.engine.snapshotBuffer?.get(snapshotTick);
+        const localSnapshotState = localSnapshot?.state
+            ? new Uint8Array(localSnapshot.state)
+            : null;
+        const remoteSnapshotState = message.state
+            ? new Uint8Array(message.state)
+            : null;
+        const localHashAtSnapshotTick = this.engine.getHash(snapshotTick);
+
+        this.emit('syncPayload', {
+            tick: message.tick,
+            snapshotTick,
+            hash: message.hash,
+            localHashAtSnapshotTick,
+            localState: localSnapshotState,
+            remoteState: remoteSnapshotState,
+        });
+
         this.engine.setState(message.tick, message.state, message.playerTimeline);
         this.pendingHashMessages = [];
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);

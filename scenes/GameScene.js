@@ -3,6 +3,7 @@ import { CONFIG } from '../config.js';
 import { game, switchScene } from '../App.js';
 import { drawScreenText, draw3DButton, drawRoundRect } from '../utils/DrawUtils.js';
 import { Ship } from '../game/Ship.js';
+import { WorldState } from '../game/WorldState.js';
 import { Minimap } from '../game/Minimap.js';
 import { assetManager } from '../utils/AssetManager.js';
 import { HUD } from '../ui/HUD.js';
@@ -45,6 +46,7 @@ export class GameScene {
         this._sessionInputDelayHandler = null;
         this._sessionDesyncHandler = null;
         this._sessionLagReportHandler = null;
+        this._sessionSyncPayloadHandler = null;
         this._sessionStateChangeHandler = null;
         this._sessionErrorHandler = null;
         this._autoPausedForHidden = false;
@@ -302,6 +304,174 @@ export class GameScene {
         }
     }
 
+    normalizeAngleDelta(delta) {
+        let d = delta;
+        if (d > 180) d -= 360;
+        if (d < -180) d += 360;
+        return d;
+    }
+
+    decodeStateBytesToWorld(stateBytes) {
+        if (!(stateBytes instanceof Uint8Array)) return null;
+        try {
+            const world = new WorldState();
+            world.deserialize(stateBytes);
+            return world;
+        } catch {
+            return null;
+        }
+    }
+
+    buildSyncStateDiff(localStateBytes, remoteStateBytes) {
+        const localWorld = this.decodeStateBytesToWorld(localStateBytes);
+        const remoteWorld = this.decodeStateBytesToWorld(remoteStateBytes);
+
+        if (!remoteWorld) {
+            return { parseError: 'remote_state_decode_failed' };
+        }
+
+        if (!localWorld) {
+            return {
+                localAvailable: false,
+                remotePlayerCount: remoteWorld.players.size,
+                remoteDebrisCount: remoteWorld.debris.length,
+            };
+        }
+
+        const bump = (map, key) => { map[key] = (map[key] || 0) + 1; };
+        const fieldCounts = {};
+        const ids = new Set([...localWorld.players.keys(), ...remoteWorld.players.keys()]);
+        const changedPlayers = [];
+
+        for (const id of [...ids].sort((a, b) => a.localeCompare(b))) {
+            const local = localWorld.players.get(id);
+            const remote = remoteWorld.players.get(id);
+
+            if (!local && remote) {
+                bump(fieldCounts, 'player_added');
+                changedPlayers.push({ id, status: 'added' });
+                continue;
+            }
+            if (local && !remote) {
+                bump(fieldCounts, 'player_removed');
+                changedPlayers.push({ id, status: 'removed' });
+                continue;
+            }
+            if (!local || !remote) continue;
+
+            const posDist = Math.hypot((remote.x || 0) - (local.x || 0), (remote.y || 0) - (local.y || 0));
+            const headingDiff = Math.abs(this.normalizeAngleDelta((remote.heading || 0) - (local.heading || 0)));
+            const healthDiff = Math.abs((remote.health || 0) - (local.health || 0));
+            const knockbackDiff = Math.hypot(
+                (remote.knockbackX || 0) - (local.knockbackX || 0),
+                (remote.knockbackY || 0) - (local.knockbackY || 0)
+            );
+            const slowTimerDiff = Math.abs((remote.slowTimer || 0) - (local.slowTimer || 0));
+            const invincibilityDiff = Math.abs((remote.invincibilityTimer || 0) - (local.invincibilityTimer || 0));
+            const speedTierChanged = (remote.speedTier || 0) !== (local.speedTier || 0);
+            const aliveChanged = !!remote.alive !== !!local.alive;
+            const localCooldowns = local.cooldowns || [];
+            const remoteCooldowns = remote.cooldowns || [];
+            let cooldownL1 = 0;
+            for (let i = 0; i < Math.max(localCooldowns.length, remoteCooldowns.length); i++) {
+                cooldownL1 += Math.abs((remoteCooldowns[i] || 0) - (localCooldowns[i] || 0));
+            }
+            const localLastInput = localWorld.lastInput.get(id) || 0;
+            const remoteLastInput = remoteWorld.lastInput.get(id) || 0;
+            const lastInputChanged = localLastInput !== remoteLastInput;
+
+            const changed =
+                posDist > 0.01 ||
+                headingDiff > 0.01 ||
+                healthDiff > 0.01 ||
+                knockbackDiff > 0.01 ||
+                slowTimerDiff > 0.01 ||
+                invincibilityDiff > 0.01 ||
+                speedTierChanged ||
+                aliveChanged ||
+                cooldownL1 > 0.01 ||
+                lastInputChanged;
+
+            if (!changed) continue;
+
+            if (posDist > 0.01) bump(fieldCounts, 'position');
+            if (headingDiff > 0.01) bump(fieldCounts, 'heading');
+            if (healthDiff > 0.01) bump(fieldCounts, 'health');
+            if (knockbackDiff > 0.01) bump(fieldCounts, 'knockback');
+            if (slowTimerDiff > 0.01) bump(fieldCounts, 'slowTimer');
+            if (invincibilityDiff > 0.01) bump(fieldCounts, 'invincibilityTimer');
+            if (speedTierChanged) bump(fieldCounts, 'speedTier');
+            if (aliveChanged) bump(fieldCounts, 'alive');
+            if (cooldownL1 > 0.01) bump(fieldCounts, 'cooldowns');
+            if (lastInputChanged) bump(fieldCounts, 'lastInput');
+
+            changedPlayers.push({
+                id,
+                status: 'changed',
+                posDist: Number(posDist.toFixed(3)),
+                headingDiff: Number(headingDiff.toFixed(3)),
+                healthDiff: Number(healthDiff.toFixed(3)),
+                knockbackDiff: Number(knockbackDiff.toFixed(3)),
+                cooldownL1: Number(cooldownL1.toFixed(3)),
+                speedTierChanged,
+                aliveChanged,
+                lastInputChanged,
+            });
+        }
+
+        changedPlayers.sort((a, b) => {
+            const scoreA = (a.posDist || 0) * 10 + (a.healthDiff || 0) + (a.cooldownL1 || 0) + (a.knockbackDiff || 0);
+            const scoreB = (b.posDist || 0) * 10 + (b.healthDiff || 0) + (b.cooldownL1 || 0) + (b.knockbackDiff || 0);
+            return scoreB - scoreA;
+        });
+
+        const localDebris = localWorld.debris || [];
+        const remoteDebris = remoteWorld.debris || [];
+        const minDebris = Math.min(localDebris.length, remoteDebris.length);
+        let debrisPosDiffCount = 0;
+        let debrisTypeDiffCount = 0;
+        let debrisLifeDiffCount = 0;
+        let maxDebrisPosDiff = 0;
+
+        for (let i = 0; i < minDebris; i++) {
+            const l = localDebris[i];
+            const r = remoteDebris[i];
+            const dist = Math.hypot((r.x || 0) - (l.x || 0), (r.y || 0) - (l.y || 0));
+            if (dist > 0.01) {
+                debrisPosDiffCount++;
+                if (dist > maxDebrisPosDiff) maxDebrisPosDiff = dist;
+            }
+            if ((l.type || '') !== (r.type || '') || (l.spriteKey || '') !== (r.spriteKey || '')) {
+                debrisTypeDiffCount++;
+            }
+            if (Math.abs((r.life || 0) - (l.life || 0)) > 0.01) {
+                debrisLifeDiffCount++;
+            }
+        }
+
+        if (debrisPosDiffCount > 0) bump(fieldCounts, 'debris_position');
+        if (debrisTypeDiffCount > 0) bump(fieldCounts, 'debris_type');
+        if (debrisLifeDiffCount > 0) bump(fieldCounts, 'debris_life');
+        if (localDebris.length !== remoteDebris.length) bump(fieldCounts, 'debris_count');
+
+        return {
+            localAvailable: true,
+            localPlayerCount: localWorld.players.size,
+            remotePlayerCount: remoteWorld.players.size,
+            changedPlayerCount: changedPlayers.length,
+            topChangedPlayers: changedPlayers.slice(0, 8),
+            fieldCounts,
+            debris: {
+                localCount: localDebris.length,
+                remoteCount: remoteDebris.length,
+                posDiffCount: debrisPosDiffCount,
+                typeDiffCount: debrisTypeDiffCount,
+                lifeDiffCount: debrisLifeDiffCount,
+                maxPosDiff: Number(maxDebrisPosDiff.toFixed(3)),
+            },
+        };
+    }
+
     /**
      * Replace the left-joystick arc in inputRender with a no-op so the
      * LittleJS built-in pad only draws the right-side buttons.
@@ -450,6 +620,19 @@ export class GameScene {
                 });
             };
             this.session.on('lagReport', this._sessionLagReportHandler);
+        }
+        if (!this._sessionSyncPayloadHandler) {
+            this._sessionSyncPayloadHandler = (payload) => {
+                const diff = this.buildSyncStateDiff(payload?.localState, payload?.remoteState);
+                this.recordTelemetry('sync_state_diff', {
+                    tick: payload?.tick ?? -1,
+                    snapshotTick: payload?.snapshotTick ?? -1,
+                    syncHash: payload?.hash ?? null,
+                    localHashAtSnapshotTick: payload?.localHashAtSnapshotTick ?? null,
+                    ...diff,
+                });
+            };
+            this.session.on('syncPayload', this._sessionSyncPayloadHandler);
         }
         if (!this._sessionStateChangeHandler) {
             this._sessionStateChangeHandler = (newState, oldState) => {
@@ -1222,6 +1405,10 @@ export class GameScene {
         if (this._sessionLagReportHandler && this.session) {
             this.session.off('lagReport', this._sessionLagReportHandler);
             this._sessionLagReportHandler = null;
+        }
+        if (this._sessionSyncPayloadHandler && this.session) {
+            this.session.off('syncPayload', this._sessionSyncPayloadHandler);
+            this._sessionSyncPayloadHandler = null;
         }
         if (this._sessionStateChangeHandler && this.session) {
             this.session.off('stateChange', this._sessionStateChangeHandler);
