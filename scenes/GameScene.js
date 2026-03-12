@@ -7,7 +7,7 @@ import { Minimap } from '../game/Minimap.js';
 import { assetManager } from '../utils/AssetManager.js';
 import { HUD } from '../ui/HUD.js';
 import { WheelControl } from '../ui/WheelControl.js';
-import { SessionState, PlayerRole, PlayerConnectionState } from '../netcode/index.js';
+import { SessionState } from '../netcode/index.js';
 
 let _buttons = [];
 function regBtn(x, y, w, h, id, cb) { _buttons.push({ x, y, w, h, id, cb }); }
@@ -42,14 +42,8 @@ export class GameScene {
         this._awaitingSync = false;
         this._lastSyncRequestAtMs = 0;
         this._sessionSyncHandler = null;
-        this._sessionSyncRequestedHandler = null;
         this._autoPausedForHidden = false;
         this._visibilityHandler = null;
-        this._networkStepTimer = null;
-        this._lastNetworkPumpMs = 0;
-        this._networkAccumulatorMs = 0;
-        this._hadRollbackSinceVisualUpdate = false;
-        this.simRenderState = new Map();
         this.renderShipState = new Map();
         this.renderShips = new Map();
 
@@ -143,7 +137,6 @@ export class GameScene {
         this._lastSyncRequestAtMs = 0;
         this.renderShipState.clear();
         this.renderShips.clear();
-        this.simRenderState.clear();
 
         if (!this._visibilityHandler) {
             this._visibilityHandler = () => this.onVisibilityChange();
@@ -153,23 +146,11 @@ export class GameScene {
             this._sessionSyncHandler = () => {
                 this._awaitingSync = false;
                 this._hadRollbackThisUpdate = false;
-                this._hadRollbackSinceVisualUpdate = false;
                 this.resetSimulationClock(this.session ? this.session.currentTick : 0);
-                this.resetNetworkSimulationClock();
-                this.captureSimulationRenderState(true);
                 this.renderShipState.clear();
                 this.syncWheelHeadingToLocal();
             };
             this.session.on('synced', this._sessionSyncHandler);
-        }
-        if (!this._sessionSyncRequestedHandler) {
-            this._sessionSyncRequestedHandler = () => {
-                if (!this.session || this.session.isHost) return;
-                this._awaitingSync = true;
-                this._lastSyncRequestAtMs = performance.now();
-                this.resetNetworkSimulationClock();
-            };
-            this.session.on('syncRequested', this._sessionSyncRequestedHandler);
         }
         const local = this.worldState.players.get(this.worldState.localPlayerId);
         if (local) {
@@ -190,9 +171,6 @@ export class GameScene {
             // Enable left-joystick suppression for the duration of this scene
             GameScene._suppressLeftJoystick = true;
         }
-
-        this.captureSimulationRenderState(true);
-        this.updateNetworkSimulationMode();
     }
 
     onVisibilityChange() {
@@ -221,82 +199,12 @@ export class GameScene {
         }
 
         this.resetSimulationClock(this.session.currentTick);
-        this.resetNetworkSimulationClock();
         this.syncWheelHeadingToLocal();
     }
 
     resetSimulationClock(currentTick = 0) {
         this.simClockStartMs = performance.now();
         this.simClockStartTick = currentTick;
-    }
-
-    resetNetworkSimulationClock() {
-        this._lastNetworkPumpMs = performance.now();
-        this._networkAccumulatorMs = 0;
-    }
-
-    captureSimulationRenderState(forceReset = false) {
-        for (const [id, pdata] of this.worldState.players) {
-            let state = this.simRenderState.get(id);
-            if (!state || forceReset) {
-                state = {
-                    prevX: pdata.x,
-                    prevY: pdata.y,
-                    prevHeading: pdata.heading,
-                    x: pdata.x,
-                    y: pdata.y,
-                    heading: pdata.heading,
-                    alive: pdata.alive,
-                };
-                this.simRenderState.set(id, state);
-                continue;
-            }
-
-            state.prevX = state.x;
-            state.prevY = state.y;
-            state.prevHeading = state.heading;
-            state.x = pdata.x;
-            state.y = pdata.y;
-            state.heading = pdata.heading;
-            state.alive = pdata.alive;
-        }
-
-        for (const id of this.simRenderState.keys()) {
-            if (!this.worldState.players.has(id)) {
-                this.simRenderState.delete(id);
-            }
-        }
-    }
-
-    getNetworkInterpolationAlpha() {
-        return Math.max(0, Math.min(1, this._networkAccumulatorMs / this.simTickMs));
-    }
-
-    getInterpolatedLocalShipState(id, pdata) {
-        const state = this.simRenderState.get(id);
-        if (!state || !this.shouldUseNetworkStepTimer() || id !== this.worldState.localPlayerId) {
-            return null;
-        }
-
-        if (state.alive !== pdata.alive) {
-            return { ...pdata, x: state.x, y: state.y, heading: state.heading };
-        }
-
-        const alpha = this.getNetworkInterpolationAlpha();
-        let headingDiff = state.heading - state.prevHeading;
-        if (headingDiff > 180) headingDiff -= 360;
-        if (headingDiff < -180) headingDiff += 360;
-
-        let heading = state.prevHeading + headingDiff * alpha;
-        if (heading >= 360) heading -= 360;
-        if (heading < 0) heading += 360;
-
-        return {
-            ...pdata,
-            x: state.prevX + (state.x - state.prevX) * alpha,
-            y: state.prevY + (state.y - state.prevY) * alpha,
-            heading,
-        };
     }
 
     syncWheelHeadingToLocal() {
@@ -313,77 +221,6 @@ export class GameScene {
         const elapsedMs = Math.max(0, nowMs - this.simClockStartMs);
         const elapsedTicks = Math.floor(elapsedMs / this.simTickMs);
         return this.simClockStartTick + elapsedTicks + 1;
-    }
-
-    hasConnectedRemotePlayers() {
-        if (!this.session?.playerManager) return false;
-
-        for (const player of this.session.playerManager.values()) {
-            if (player.id === this.session.localPlayerId) continue;
-            if (player.role !== PlayerRole.Player) continue;
-            if (player.connectionState !== PlayerConnectionState.Connected) continue;
-            return true;
-        }
-
-        return false;
-    }
-
-    shouldUseNetworkStepTimer() {
-        return this.hasConnectedRemotePlayers();
-    }
-
-    startNetworkSimulationLoop() {
-        if (this._networkStepTimer || !this.shouldUseNetworkStepTimer()) return;
-        this.resetNetworkSimulationClock();
-        this._networkStepTimer = setInterval(() => this.runNetworkSimulationPump(), Math.max(4, Math.floor(this.simTickMs / 2)));
-    }
-
-    stopNetworkSimulationLoop() {
-        if (!this._networkStepTimer) return;
-        clearInterval(this._networkStepTimer);
-        this._networkStepTimer = null;
-        this._networkAccumulatorMs = 0;
-    }
-
-    updateNetworkSimulationMode() {
-        if (this.shouldUseNetworkStepTimer()) {
-            this.startNetworkSimulationLoop();
-        } else {
-            this.stopNetworkSimulationLoop();
-        }
-    }
-
-    runNetworkSimulationPump() {
-        if (!this.session || !this.shouldUseNetworkStepTimer()) return;
-
-        if (this.session.state !== SessionState.Playing) {
-            this.resetNetworkSimulationClock();
-            return;
-        }
-
-        if (!this.session.isHost && this._awaitingSync) {
-            this.resetNetworkSimulationClock();
-            return;
-        }
-
-        const nowMs = performance.now();
-        const elapsedMs = Math.max(0, Math.min(250, nowMs - this._lastNetworkPumpMs));
-        this._lastNetworkPumpMs = nowMs;
-        this._networkAccumulatorMs += elapsedMs;
-
-        let steps = 0;
-        const maxStepsPerPump = Math.max(8, this.maxCatchUpTicksPerFrame);
-
-        while (this._networkAccumulatorMs >= this.simTickMs && steps < maxStepsPerPump) {
-            const input = this.updateLocalInput();
-            const result = this.session.tick(input);
-            if (result?.rolledBack) {
-                this._hadRollbackSinceVisualUpdate = true;
-            }
-            this.captureSimulationRenderState();
-            this._networkAccumulatorMs -= this.simTickMs;
-            steps++;
-        }
     }
 
     updateLocalInput() {
@@ -467,18 +304,6 @@ export class GameScene {
                 continue;
             }
 
-            if (isLocal && this.shouldUseNetworkStepTimer()) {
-                smooth.x = pdata.x;
-                smooth.y = pdata.y;
-                smooth.heading = pdata.heading;
-                smooth.alive = pdata.alive;
-
-                if (hadRollback && this.wheelControl && !this.wheelControl.active) {
-                    this.wheelControl.syncToHeading(pdata.heading);
-                }
-                continue;
-            }
-
             const dx = pdata.x - smooth.x;
             const dy = pdata.y - smooth.y;
             const dist = Math.hypot(dx, dy);
@@ -531,7 +356,6 @@ export class GameScene {
 
     onUpdate() {
         if (!this.session) return;
-        this.updateNetworkSimulationMode();
 
         if (!this.session.isHost && this._awaitingSync) {
             const nowMs = performance.now();
@@ -539,41 +363,33 @@ export class GameScene {
                 this.session.requestSync?.();
                 this._lastSyncRequestAtMs = nowMs;
             }
-            this._hadRollbackThisUpdate = this._hadRollbackSinceVisualUpdate;
-            this._hadRollbackSinceVisualUpdate = false;
             this.updateRenderShipState();
             return;
         }
 
-        if (this.shouldUseNetworkStepTimer()) {
-            this._hadRollbackThisUpdate = this._hadRollbackSinceVisualUpdate;
-            this._hadRollbackSinceVisualUpdate = false;
-        } else {
-            const now = performance.now();
-            const desiredCurrentTick = this.getDesiredCurrentTick(now);
-            let ticksToProcess = Math.max(0, desiredCurrentTick - this.session.currentTick);
+        const now = performance.now();
+        const desiredCurrentTick = this.getDesiredCurrentTick(now);
+        let ticksToProcess = Math.max(0, desiredCurrentTick - this.session.currentTick);
 
-            const dynamicMaxCatchUp = this.session?.isHost
-                ? Math.max(this.maxCatchUpTicksPerFrame, Math.floor(this.maxCatchUpTicksPerFrame * 1.5))
-                : this.maxCatchUpTicksPerFrame;
+        const dynamicMaxCatchUp = this.session?.isHost
+            ? Math.max(this.maxCatchUpTicksPerFrame, Math.floor(this.maxCatchUpTicksPerFrame * 1.5))
+            : this.maxCatchUpTicksPerFrame;
 
-            if (ticksToProcess > dynamicMaxCatchUp) {
-                const lagTicks = ticksToProcess - dynamicMaxCatchUp;
-                ticksToProcess = dynamicMaxCatchUp;
+        if (ticksToProcess > dynamicMaxCatchUp) {
+            const lagTicks = ticksToProcess - dynamicMaxCatchUp;
+            ticksToProcess = dynamicMaxCatchUp;
 
-                // If we're severely behind wall-clock, rebase to prevent endless saturation.
-                if (lagTicks > dynamicMaxCatchUp * 3) {
-                    this.resetSimulationClock(this.session.currentTick + ticksToProcess);
-                }
+            // If we're severely behind wall-clock, rebase to prevent endless saturation.
+            if (lagTicks > dynamicMaxCatchUp * 3) {
+                this.resetSimulationClock(this.session.currentTick + ticksToProcess);
             }
+        }
 
-            this._hadRollbackThisUpdate = false;
-            for (let i = 0; i < ticksToProcess; i++) {
-                const input = this.updateLocalInput();
-                const result = this.session.tick(input);
-                if (result?.rolledBack) this._hadRollbackThisUpdate = true;
-                this.captureSimulationRenderState();
-            }
+        this._hadRollbackThisUpdate = false;
+        for (let i = 0; i < ticksToProcess; i++) {
+            const input = this.updateLocalInput();
+            const result = this.session.tick(input);
+            if (result?.rolledBack) this._hadRollbackThisUpdate = true;
         }
 
         this.updateRenderShipState();
@@ -609,11 +425,10 @@ export class GameScene {
 
         const focusPlayer = this.worldState.players.get(focusId);
         const focusSmooth = this.renderShipState.get(focusId);
-        const interpolatedLocalFocus = focusPlayer ? this.getInterpolatedLocalShipState(focusId, focusPlayer) : null;
         this.focusId = focusId;
         if (focusPlayer) {
-            const targetCamX = interpolatedLocalFocus ? interpolatedLocalFocus.x : (focusSmooth ? focusSmooth.x : focusPlayer.x);
-            const targetCamY = interpolatedLocalFocus ? interpolatedLocalFocus.y : (focusSmooth ? focusSmooth.y : focusPlayer.y);
+            const targetCamX = focusSmooth ? focusSmooth.x : focusPlayer.x;
+            const targetCamY = focusSmooth ? focusSmooth.y : focusPlayer.y;
             this.camX += (targetCamX - this.camX) * 0.1;
             this.camY += (targetCamY - this.camY) * 0.1;
 
@@ -736,11 +551,10 @@ export class GameScene {
 
         // Render Ships
         for (const [id, pdata] of this.worldState.players) {
-            const interpolatedLocal = this.getInterpolatedLocalShipState(id, pdata);
             const smooth = this.renderShipState.get(id);
-            const renderPdata = interpolatedLocal || (smooth
+            const renderPdata = smooth
                 ? { ...pdata, x: smooth.x, y: smooth.y, heading: smooth.heading }
-                : pdata);
+                : pdata;
 
             // Keep render-only ship objects separate from simulation ship instances.
             let ship = this.renderShips.get(id);
@@ -886,16 +700,9 @@ export class GameScene {
             this.session.off('synced', this._sessionSyncHandler);
             this._sessionSyncHandler = null;
         }
-        if (this._sessionSyncRequestedHandler && this.session) {
-            this.session.off('syncRequested', this._sessionSyncRequestedHandler);
-            this._sessionSyncRequestedHandler = null;
-        }
-        this.stopNetworkSimulationLoop();
-        this.simRenderState.clear();
         this.renderShipState.clear();
         this.renderShips.clear();
         this._hadRollbackThisUpdate = false;
-        this._hadRollbackSinceVisualUpdate = false;
         this._awaitingSync = false;
         // Detach wheel touch listeners
         if (this.wheelControl) {
