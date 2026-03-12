@@ -58,10 +58,16 @@ class StubTransport {
         this.onConnect = null;
         this.onDisconnect = null;
         this.onKeepalivePing = null;
+        this.sent = [];
+        this.broadcasts = [];
     }
 
-    send() { }
-    broadcast() { }
+    send(peerId, data, reliable = false) {
+        this.sent.push({ peerId, data, reliable });
+    }
+    broadcast(data, reliable = false) {
+        this.broadcasts.push({ data, reliable });
+    }
     disconnectAll() { }
 }
 
@@ -161,6 +167,52 @@ test('WorldState hash normalizes benign float representation differences', () =>
 
     nearEquivalentView.setFloat32(xOffset, nearEquivalentView.getFloat32(xOffset, true) + 0.02, true);
     assert.notEqual(world.hashSerialized(nearEquivalentState), baselineHash);
+});
+
+test('WorldState step normalizes authoritative simulation floats to float32', () => {
+    const world = createWorldStateWithPlayers(['p1']);
+    const player = world.players.get('p1');
+    player.knockbackX = 1 / 3;
+    player.knockbackY = -1 / 7;
+    player.invincibilityTimer = 1 / 3;
+    player.slowTimer = 1 / 5;
+    player.cooldowns = [1 / 3, 1 / 7, 1 / 9, 1 / 11, 1 / 13];
+    world.debris.push({
+        x: -1000 + (1 / 3),
+        y: -1000 + (1 / 7),
+        vx: 1 / 5,
+        vy: -1 / 9,
+        life: 1 / 3,
+        damage: 2 / 7,
+        radius: 3 / 11,
+        duration: 1 / 13,
+        type: 'damage',
+        spriteKey: 'debris',
+    });
+
+    world.step(new Map([['p1', makeInput(0x02)]]));
+
+    const updatedPlayer = world.players.get('p1');
+    assert.equal(updatedPlayer.x, Math.fround(updatedPlayer.x));
+    assert.equal(updatedPlayer.y, Math.fround(updatedPlayer.y));
+    assert.equal(updatedPlayer.heading, Math.fround(updatedPlayer.heading));
+    assert.equal(updatedPlayer.knockbackX, Math.fround(updatedPlayer.knockbackX));
+    assert.equal(updatedPlayer.knockbackY, Math.fround(updatedPlayer.knockbackY));
+    assert.equal(updatedPlayer.invincibilityTimer, Math.fround(updatedPlayer.invincibilityTimer));
+    assert.equal(updatedPlayer.slowTimer, Math.fround(updatedPlayer.slowTimer));
+    for (const cooldown of updatedPlayer.cooldowns) {
+        assert.equal(cooldown, Math.fround(cooldown));
+    }
+
+    const updatedDebris = world.debris[0];
+    assert.equal(updatedDebris.x, Math.fround(updatedDebris.x));
+    assert.equal(updatedDebris.y, Math.fround(updatedDebris.y));
+    assert.equal(updatedDebris.vx, Math.fround(updatedDebris.vx));
+    assert.equal(updatedDebris.vy, Math.fround(updatedDebris.vy));
+    assert.equal(updatedDebris.life, Math.fround(updatedDebris.life));
+    assert.equal(updatedDebris.damage, Math.fround(updatedDebris.damage));
+    assert.equal(updatedDebris.radius, Math.fround(updatedDebris.radius));
+    assert.equal(updatedDebris.duration, Math.fround(updatedDebris.duration));
 });
 
 test('RollbackEngine converges after delayed remote inputs', () => {
@@ -477,7 +529,7 @@ test('Session accepts host-relayed input messages in star topology', async () =>
     session.destroy();
 });
 
-test('Session requests a sync when a non-host stalls on speculation', async () => {
+test('Session delays client sync requests until a stall persists', async () => {
     const session = new Session({
         game: {
             step() { },
@@ -511,11 +563,110 @@ test('Session requests a sync when a non-host stalls on speculation', async () =
         syncRequests++;
     };
 
-    session.tick(makeInput(0x01));
-    session.tick(makeInput(0x01));
-    const result = session.tick(makeInput(0x01));
+    const realDateNow = Date.now;
+    let now = 1_000;
+    Date.now = () => now;
 
-    assert.equal(result.stalled, true);
+    try {
+        session.tick(makeInput(0x01));
+        now += 16;
+        session.tick(makeInput(0x01));
+        now += 16;
+        let result = session.tick(makeInput(0x01));
+
+        assert.equal(result.stalled, true);
+        assert.equal(syncRequests, 0);
+
+        now += 1_000;
+        result = session.tick(makeInput(0x01));
+        assert.equal(result.stalled, true);
+        assert.equal(syncRequests, 0);
+
+        now += 600;
+        result = session.tick(makeInput(0x01));
+        assert.equal(result.stalled, true);
+        assert.equal(syncRequests, 1);
+
+        now += 600;
+        result = session.tick(makeInput(0x01));
+        assert.equal(result.stalled, true);
+        assert.equal(syncRequests, 1);
+    } finally {
+        Date.now = realDateNow;
+    }
+
+    session.destroy();
+});
+
+test('Session only syncs the requesting peer after a sync request', async () => {
+    const transport = new StubTransport('host');
+    const session = new Session({
+        game: {
+            step() { },
+            serialize() { return new Uint8Array([0]); },
+            deserialize() { },
+            hashSerialized(bytes) { return bytes[0] ?? 0; },
+        },
+        transport,
+        config: {
+            inputSizeBytes: 3,
+            snapshotHistorySize: 32,
+            maxSpeculationTicks: 16,
+        },
+    });
+
+    await session.createRoom();
+    session.handleSyncRequest('peer-a', { playerId: 'peer-a' });
+
+    assert.equal(transport.sent.length, 1);
+    assert.equal(transport.sent[0].peerId, 'peer-a');
+    assert.equal(transport.broadcasts.length, 0);
+    session.destroy();
+});
+
+test('Session requires repeated hash mismatches before requesting a sync', async () => {
+    const session = new Session({
+        game: {
+            step() { },
+            serialize() { return new Uint8Array([0]); },
+            deserialize() { },
+            hashSerialized(bytes) { return bytes[0] ?? 0; },
+        },
+        transport: new StubTransport('client-peer'),
+        config: {
+            inputSizeBytes: 3,
+            snapshotHistorySize: 32,
+            maxSpeculationTicks: 16,
+            hashInterval: 60,
+        },
+    });
+
+    session.playerManager.set('host-peer', {
+        id: 'host-peer',
+        name: 'Host',
+        connectionState: 1,
+        joinTick: null,
+        leaveTick: null,
+        isHost: true,
+        role: 0,
+        rtt: 0,
+    });
+
+    session.engine._currentTick = 180;
+    session.engine._confirmedTick = 180;
+    session.engine.getHash = () => 1234;
+
+    let syncRequests = 0;
+    session.requestSync = () => {
+        syncRequests++;
+    };
+
+    session.pendingHashMessages.push({ tick: 60, playerId: 'host-peer', hash: 9999 });
+    session.processPendingHashComparisons();
+    assert.equal(syncRequests, 0);
+
+    session.pendingHashMessages.push({ tick: 120, playerId: 'host-peer', hash: 9999 });
+    session.processPendingHashComparisons();
     assert.equal(syncRequests, 1);
     session.destroy();
 });

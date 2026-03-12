@@ -162,6 +162,49 @@ export class WorldState {
         return Math.round((Object.is(normalized, -0) ? 0 : normalized) * scale);
     }
 
+    normalizeSimulationFloat(value) {
+        const normalized = Number.isFinite(value) ? value : 0;
+        return Math.fround(Object.is(normalized, -0) ? 0 : normalized);
+    }
+
+    normalizePlayerState(player) {
+        player.x = this.normalizeSimulationFloat(player.x);
+        player.y = this.normalizeSimulationFloat(player.y);
+        player.heading = this.normalizeSimulationFloat(player.heading);
+        player.health = this.normalizeSimulationFloat(player.health);
+        player.knockbackX = this.normalizeSimulationFloat(player.knockbackX || 0);
+        player.knockbackY = this.normalizeSimulationFloat(player.knockbackY || 0);
+        player.invincibilityTimer = this.normalizeSimulationFloat(player.invincibilityTimer || 0);
+        player.slowTimer = this.normalizeSimulationFloat(player.slowTimer || 0);
+
+        if (Array.isArray(player.cooldowns)) {
+            for (let i = 0; i < player.cooldowns.length; i++) {
+                player.cooldowns[i] = this.normalizeSimulationFloat(player.cooldowns[i] || 0);
+            }
+        }
+    }
+
+    normalizeDebrisState(debris) {
+        debris.x = this.normalizeSimulationFloat(debris.x);
+        debris.y = this.normalizeSimulationFloat(debris.y);
+        debris.vx = this.normalizeSimulationFloat(debris.vx);
+        debris.vy = this.normalizeSimulationFloat(debris.vy);
+        debris.life = this.normalizeSimulationFloat(debris.life);
+        debris.damage = this.normalizeSimulationFloat(debris.damage);
+        debris.radius = this.normalizeSimulationFloat(debris.radius);
+        debris.duration = this.normalizeSimulationFloat(debris.duration || 0);
+    }
+
+    normalizeSimulationState() {
+        for (const [, player] of this.players) {
+            this.normalizePlayerState(player);
+        }
+
+        for (const debris of this.debris) {
+            this.normalizeDebrisState(debris);
+        }
+    }
+
     hashPlayerState(hash, id, player, lastInput) {
         let next = hash;
         next = this.hashMixString(next, id);
@@ -781,6 +824,8 @@ export class WorldState {
                 }
             }
         }
+
+        this.normalizeSimulationState();
     }
 
     hash() {

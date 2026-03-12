@@ -16,6 +16,8 @@ import { RollbackEngine } from './engine.js';
 
 const RATE_LIMIT_CLEANUP_INTERVAL_MS = 60000;
 const DEFAULT_LAG_REPORT_COOLDOWN_TICKS = 30;
+const CLIENT_STALL_SYNC_THRESHOLD_MS = 1500;
+const HASH_MISMATCH_SYNC_THRESHOLD = 2;
 
 function generateRoomId() {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -58,6 +60,8 @@ export class Session {
         this.syncRequestCooldownMs = 500;
         this.rollbackPressure = 0;
         this.stalledPlayers = new Map();
+        this.clientStallStartedAtMs = 0;
+        this.consecutiveHashMismatches = new Map();
 
         this.engine = this.createEngine();
 
@@ -230,6 +234,8 @@ export class Session {
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.rollbackPressure = 0;
         this.stalledPlayers = new Map();
+        this.clientStallStartedAtMs = 0;
+        this.consecutiveHashMismatches = new Map();
         this.pendingHashMessages = [];
         this.engine = this.createEngine();
     }
@@ -302,6 +308,8 @@ export class Session {
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.rollbackPressure = 0;
         this.stalledPlayers.clear();
+        this.clientStallStartedAtMs = 0;
+        this.consecutiveHashMismatches.clear();
 
         this.playerManager.set(this._localPlayerId, {
             id: this.localPlayerId,
@@ -326,6 +334,8 @@ export class Session {
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.rollbackPressure = 0;
         this.stalledPlayers.clear();
+        this.clientStallStartedAtMs = 0;
+        this.consecutiveHashMismatches.clear();
 
         const startTick = asTick(0);
         for (const player of this.playerManager.values()) {
@@ -416,7 +426,10 @@ export class Session {
 
     handleSpeculationStall(result) {
         if (!result?.stalled) {
-            this.stalledPlayers.clear();
+            this.clientStallStartedAtMs = 0;
+            if (this._isHost) {
+                this.stalledPlayers.clear();
+            }
             return;
         }
 
@@ -426,7 +439,18 @@ export class Session {
         });
 
         if (!this._isHost) {
-            this.requestSync();
+            const now = Date.now();
+            if (this.clientStallStartedAtMs === Number.POSITIVE_INFINITY) {
+                return;
+            }
+            if (this.clientStallStartedAtMs === 0) {
+                this.clientStallStartedAtMs = now;
+                return;
+            }
+            if (now - this.clientStallStartedAtMs >= CLIENT_STALL_SYNC_THRESHOLD_MS) {
+                this.requestSync();
+                this.clientStallStartedAtMs = Number.POSITIVE_INFINITY;
+            }
             return;
         }
 
@@ -486,6 +510,8 @@ export class Session {
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.rollbackPressure = 0;
         this.stalledPlayers.clear();
+        this.clientStallStartedAtMs = 0;
+        this.consecutiveHashMismatches.clear();
         this.emit('synced', state.tick);
     }
 
@@ -563,7 +589,7 @@ export class Session {
                 this.handleSyncMessage(message);
                 break;
             case MessageType.SyncRequest:
-                this.handleSyncRequest(message);
+                this.handleSyncRequest(peerId, message);
                 break;
             case MessageType.JoinRequest:
                 this.handleJoinRequest(peerId, message);
@@ -648,9 +674,17 @@ export class Session {
 
             const localHash = this.engine.getHash(pending.tick);
             if (localHash !== undefined && localHash !== pending.hash) {
+                const mismatchCount = (this.consecutiveHashMismatches.get(pending.playerId) ?? 0) + 1;
+                this.consecutiveHashMismatches.set(pending.playerId, mismatchCount);
                 this.emit('desync', pending.tick, localHash, pending.hash);
-                if (!this._isHost) this.requestSync();
+                if (!this._isHost && mismatchCount >= HASH_MISMATCH_SYNC_THRESHOLD) {
+                    this.requestSync();
+                    this.consecutiveHashMismatches.delete(pending.playerId);
+                }
+                continue;
             }
+
+            this.consecutiveHashMismatches.delete(pending.playerId);
         }
 
         this.pendingHashMessages = remaining;
@@ -663,6 +697,8 @@ export class Session {
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.rollbackPressure = 0;
         this.stalledPlayers.clear();
+        this.clientStallStartedAtMs = 0;
+        this.consecutiveHashMismatches.clear();
 
         for (const entry of message.playerTimeline) {
             const connectionState = entry.leaveTick !== null ? PlayerConnectionState.Disconnected : PlayerConnectionState.Connected;
@@ -697,7 +733,7 @@ export class Session {
         this.emit('synced', message.tick);
     }
 
-    handleSyncRequest(message) {
+    handleSyncRequest(peerId, message) {
         if (!this._isHost) return;
 
         const state = this.engine.getState();
@@ -706,14 +742,7 @@ export class Session {
             if (p) pt.name = p.name;
         }
         const syncMsg = createSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline);
-        this.broadcast(syncMsg, true);
-        this.engine.resetForSync(state.tick, state.playerTimeline);
-        this.pendingHashMessages = [];
-        this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
-        this.lastAdaptiveDelayUpdateTick = asTick(-1);
-        this.rollbackPressure = 0;
-        this.stalledPlayers.clear();
-        this.emit('synced', state.tick);
+        this.transport.send(peerId, encodeMessage(syncMsg), true);
     }
 
     handleJoinRequest(peerId, message) {

@@ -157,7 +157,6 @@ export class GameScene {
                 this.resetNetworkSimulationClock();
                 this.captureSimulationRenderState(true);
                 this.renderShipState.clear();
-                this.renderShips.clear();
                 this.syncWheelHeadingToLocal();
             };
             this.session.on('synced', this._sessionSyncHandler);
