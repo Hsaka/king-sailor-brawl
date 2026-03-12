@@ -76,7 +76,7 @@ export class RollbackEngine {
         if (minConfirmed !== undefined) {
             const speculation = this._currentTick - minConfirmed;
             if (speculation >= this.maxSpeculationTicks) {
-                return { tick: this._currentTick, rolledBack: false };
+                return { tick: this._currentTick, rolledBack: false, stalled: true, speculation };
             }
         }
 

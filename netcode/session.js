@@ -57,6 +57,7 @@ export class Session {
         this.lastSyncRequestAtMs = 0;
         this.syncRequestCooldownMs = 500;
         this.rollbackPressure = 0;
+        this.stalledPlayers = new Map();
 
         this.engine = this.createEngine();
 
@@ -228,6 +229,7 @@ export class Session {
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.rollbackPressure = 0;
+        this.stalledPlayers = new Map();
         this.pendingHashMessages = [];
         this.engine = this.createEngine();
     }
@@ -299,6 +301,7 @@ export class Session {
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.rollbackPressure = 0;
+        this.stalledPlayers.clear();
 
         this.playerManager.set(this._localPlayerId, {
             id: this.localPlayerId,
@@ -322,6 +325,7 @@ export class Session {
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.rollbackPressure = 0;
+        this.stalledPlayers.clear();
 
         const startTick = asTick(0);
         for (const player of this.playerManager.values()) {
@@ -391,6 +395,7 @@ export class Session {
 
         const result = this.engine.tick();
         this.observeRollbackPressure(result);
+        this.handleSpeculationStall(result);
 
         if (result.error) {
             this.emit('error', result.error, { source: ErrorSource.Engine, recoverable: true, details: { tick: result.tick } });
@@ -407,6 +412,51 @@ export class Session {
         this.checkAndReportLag();
 
         return result;
+    }
+
+    handleSpeculationStall(result) {
+        if (!result?.stalled) {
+            this.stalledPlayers.clear();
+            return;
+        }
+
+        this.emit('stall', {
+            tick: result.tick,
+            speculation: result.speculation ?? 0,
+        });
+
+        if (!this._isHost) {
+            this.requestSync();
+            return;
+        }
+
+        const now = Date.now();
+        const currentTick = this.engine.currentTick;
+
+        for (const player of this.playerManager.values()) {
+            if (player.id === this.localPlayerId) continue;
+            if (player.role !== PlayerRole.Player) continue;
+            if (player.connectionState !== PlayerConnectionState.Connected) {
+                this.stalledPlayers.delete(player.id);
+                continue;
+            }
+
+            const confirmedTick = this.engine.getConfirmedTickForPlayer(player.id);
+            const ticksBehind = confirmedTick === undefined ? currentTick : Math.max(0, currentTick - confirmedTick);
+
+            if (ticksBehind < this.config.maxSpeculationTicks) {
+                this.stalledPlayers.delete(player.id);
+                continue;
+            }
+
+            const firstStalledAt = this.stalledPlayers.get(player.id) ?? now;
+            this.stalledPlayers.set(player.id, firstStalledAt);
+
+            if (now - firstStalledAt >= this.config.disconnectTimeout) {
+                this.dropPlayer(player.id, { reason: 'excessive_lag', ticksBehind });
+                this.stalledPlayers.delete(player.id);
+            }
+        }
     }
 
     requestSync() {
@@ -435,6 +485,7 @@ export class Session {
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.rollbackPressure = 0;
+        this.stalledPlayers.clear();
         this.emit('synced', state.tick);
     }
 
@@ -611,6 +662,7 @@ export class Session {
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.rollbackPressure = 0;
+        this.stalledPlayers.clear();
 
         for (const entry of message.playerTimeline) {
             const connectionState = entry.leaveTick !== null ? PlayerConnectionState.Disconnected : PlayerConnectionState.Connected;
@@ -660,6 +712,7 @@ export class Session {
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.rollbackPressure = 0;
+        this.stalledPlayers.clear();
         this.emit('synced', state.tick);
     }
 

@@ -48,6 +48,7 @@ export class GameScene {
         this._lastNetworkPumpMs = 0;
         this._networkAccumulatorMs = 0;
         this._hadRollbackSinceVisualUpdate = false;
+        this.simRenderState = new Map();
         this.renderShipState = new Map();
         this.renderShips = new Map();
 
@@ -141,6 +142,7 @@ export class GameScene {
         this._lastSyncRequestAtMs = 0;
         this.renderShipState.clear();
         this.renderShips.clear();
+        this.simRenderState.clear();
 
         if (!this._visibilityHandler) {
             this._visibilityHandler = () => this.onVisibilityChange();
@@ -153,6 +155,7 @@ export class GameScene {
                 this._hadRollbackSinceVisualUpdate = false;
                 this.resetSimulationClock(this.session ? this.session.currentTick : 0);
                 this.resetNetworkSimulationClock();
+                this.captureSimulationRenderState(true);
                 this.renderShipState.clear();
                 this.renderShips.clear();
                 this.syncWheelHeadingToLocal();
@@ -179,6 +182,7 @@ export class GameScene {
             GameScene._suppressLeftJoystick = true;
         }
 
+        this.captureSimulationRenderState(true);
         this.updateNetworkSimulationMode();
     }
 
@@ -220,6 +224,70 @@ export class GameScene {
     resetNetworkSimulationClock() {
         this._lastNetworkPumpMs = performance.now();
         this._networkAccumulatorMs = 0;
+    }
+
+    captureSimulationRenderState(forceReset = false) {
+        for (const [id, pdata] of this.worldState.players) {
+            let state = this.simRenderState.get(id);
+            if (!state || forceReset) {
+                state = {
+                    prevX: pdata.x,
+                    prevY: pdata.y,
+                    prevHeading: pdata.heading,
+                    x: pdata.x,
+                    y: pdata.y,
+                    heading: pdata.heading,
+                    alive: pdata.alive,
+                };
+                this.simRenderState.set(id, state);
+                continue;
+            }
+
+            state.prevX = state.x;
+            state.prevY = state.y;
+            state.prevHeading = state.heading;
+            state.x = pdata.x;
+            state.y = pdata.y;
+            state.heading = pdata.heading;
+            state.alive = pdata.alive;
+        }
+
+        for (const id of this.simRenderState.keys()) {
+            if (!this.worldState.players.has(id)) {
+                this.simRenderState.delete(id);
+            }
+        }
+    }
+
+    getNetworkInterpolationAlpha() {
+        return Math.max(0, Math.min(1, this._networkAccumulatorMs / this.simTickMs));
+    }
+
+    getInterpolatedLocalShipState(id, pdata) {
+        const state = this.simRenderState.get(id);
+        if (!state || !this.shouldUseNetworkStepTimer() || id !== this.worldState.localPlayerId) {
+            return null;
+        }
+
+        if (state.alive !== pdata.alive) {
+            return { ...pdata, x: state.x, y: state.y, heading: state.heading };
+        }
+
+        const alpha = this.getNetworkInterpolationAlpha();
+        let headingDiff = state.heading - state.prevHeading;
+        if (headingDiff > 180) headingDiff -= 360;
+        if (headingDiff < -180) headingDiff += 360;
+
+        let heading = state.prevHeading + headingDiff * alpha;
+        if (heading >= 360) heading -= 360;
+        if (heading < 0) heading += 360;
+
+        return {
+            ...pdata,
+            x: state.prevX + (state.x - state.prevX) * alpha,
+            y: state.prevY + (state.y - state.prevY) * alpha,
+            heading,
+        };
     }
 
     syncWheelHeadingToLocal() {
@@ -303,6 +371,7 @@ export class GameScene {
             if (result?.rolledBack) {
                 this._hadRollbackSinceVisualUpdate = true;
             }
+            this.captureSimulationRenderState();
             this._networkAccumulatorMs -= this.simTickMs;
             steps++;
         }
@@ -386,6 +455,18 @@ export class GameScene {
             if (!smooth) {
                 smooth = { x: pdata.x, y: pdata.y, heading: pdata.heading, alive: pdata.alive };
                 this.renderShipState.set(id, smooth);
+                continue;
+            }
+
+            if (isLocal && this.shouldUseNetworkStepTimer()) {
+                smooth.x = pdata.x;
+                smooth.y = pdata.y;
+                smooth.heading = pdata.heading;
+                smooth.alive = pdata.alive;
+
+                if (hadRollback && this.wheelControl && !this.wheelControl.active) {
+                    this.wheelControl.syncToHeading(pdata.heading);
+                }
                 continue;
             }
 
@@ -482,6 +563,7 @@ export class GameScene {
                 const input = this.updateLocalInput();
                 const result = this.session.tick(input);
                 if (result?.rolledBack) this._hadRollbackThisUpdate = true;
+                this.captureSimulationRenderState();
             }
         }
 
@@ -518,10 +600,11 @@ export class GameScene {
 
         const focusPlayer = this.worldState.players.get(focusId);
         const focusSmooth = this.renderShipState.get(focusId);
+        const interpolatedLocalFocus = focusPlayer ? this.getInterpolatedLocalShipState(focusId, focusPlayer) : null;
         this.focusId = focusId;
         if (focusPlayer) {
-            const targetCamX = focusSmooth ? focusSmooth.x : focusPlayer.x;
-            const targetCamY = focusSmooth ? focusSmooth.y : focusPlayer.y;
+            const targetCamX = interpolatedLocalFocus ? interpolatedLocalFocus.x : (focusSmooth ? focusSmooth.x : focusPlayer.x);
+            const targetCamY = interpolatedLocalFocus ? interpolatedLocalFocus.y : (focusSmooth ? focusSmooth.y : focusPlayer.y);
             this.camX += (targetCamX - this.camX) * 0.1;
             this.camY += (targetCamY - this.camY) * 0.1;
 
@@ -644,10 +727,11 @@ export class GameScene {
 
         // Render Ships
         for (const [id, pdata] of this.worldState.players) {
+            const interpolatedLocal = this.getInterpolatedLocalShipState(id, pdata);
             const smooth = this.renderShipState.get(id);
-            const renderPdata = smooth
+            const renderPdata = interpolatedLocal || (smooth
                 ? { ...pdata, x: smooth.x, y: smooth.y, heading: smooth.heading }
-                : pdata;
+                : pdata);
 
             // Keep render-only ship objects separate from simulation ship instances.
             let ship = this.renderShips.get(id);
@@ -794,6 +878,7 @@ export class GameScene {
             this._sessionSyncHandler = null;
         }
         this.stopNetworkSimulationLoop();
+        this.simRenderState.clear();
         this.renderShipState.clear();
         this.renderShips.clear();
         this._hadRollbackThisUpdate = false;

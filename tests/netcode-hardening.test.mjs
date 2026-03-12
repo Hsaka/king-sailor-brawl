@@ -261,6 +261,31 @@ test('RollbackEngine converges after delayed remote inputs', () => {
     assert.equal(sawRollback, true);
 });
 
+test('RollbackEngine reports a stall when prediction exceeds the speculation limit', () => {
+    const world = new DeterministicRollbackGame(['p1', 'p2']);
+    const engine = new RollbackEngine({
+        game: world,
+        localPlayerId: 'p1',
+        inputSizeBytes: 3,
+        snapshotHistorySize: 32,
+        maxSpeculationTicks: 3,
+    });
+    engine.addPlayer('p2', 0);
+
+    engine.setLocalInput(0, makeInput(0x01));
+    let result = engine.tick();
+    assert.equal(result.stalled, undefined);
+
+    engine.setLocalInput(1, makeInput(0x01));
+    result = engine.tick();
+    assert.equal(result.stalled, undefined);
+
+    engine.setLocalInput(2, makeInput(0x01));
+    result = engine.tick();
+    assert.equal(result.stalled, true);
+    assert.equal(result.speculation, 3);
+});
+
 test('Session rejects spoofed input messages but accepts trusted ones', async () => {
     const game = {
         state: 0,
@@ -449,5 +474,48 @@ test('Session accepts host-relayed input messages in star topology', async () =>
     session.handleMessage('host-peer', relayed);
 
     assert.equal(session.engine.getConfirmedTickForPlayer('remote-peer'), 0);
+    session.destroy();
+});
+
+test('Session requests a sync when a non-host stalls on speculation', async () => {
+    const session = new Session({
+        game: {
+            step() { },
+            serialize() { return new Uint8Array([0]); },
+            deserialize() { },
+            hashSerialized(bytes) { return bytes[0] ?? 0; },
+        },
+        transport: new StubTransport('client-peer'),
+        config: {
+            inputSizeBytes: 3,
+            snapshotHistorySize: 32,
+            maxSpeculationTicks: 3,
+        },
+    });
+
+    session.playerManager.set('host-peer', {
+        id: 'host-peer',
+        name: 'Host',
+        connectionState: 1,
+        joinTick: null,
+        leaveTick: null,
+        isHost: true,
+        role: 0,
+        rtt: 0,
+    });
+    session.engine.addPlayer('host-peer', 0);
+    session.setState(3);
+
+    let syncRequests = 0;
+    session.requestSync = () => {
+        syncRequests++;
+    };
+
+    session.tick(makeInput(0x01));
+    session.tick(makeInput(0x01));
+    const result = session.tick(makeInput(0x01));
+
+    assert.equal(result.stalled, true);
+    assert.equal(syncRequests, 1);
     session.destroy();
 });
