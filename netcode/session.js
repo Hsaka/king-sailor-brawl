@@ -18,6 +18,7 @@ const RATE_LIMIT_CLEANUP_INTERVAL_MS = 60000;
 const DEFAULT_LAG_REPORT_COOLDOWN_TICKS = 30;
 const CLIENT_STALL_SYNC_THRESHOLD_MS = 1500;
 const HASH_MISMATCH_SYNC_THRESHOLD = 2;
+const HOST_SYNC_RECOVERY_GRACE_MS = 3000;
 
 function generateRoomId() {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -60,6 +61,7 @@ export class Session {
         this.syncRequestCooldownMs = 500;
         this.rollbackPressure = 0;
         this.stalledPlayers = new Map();
+        this.syncRecoveryDeadlines = new Map();
         this.clientStallStartedAtMs = 0;
         this.consecutiveHashMismatches = new Map();
 
@@ -234,6 +236,7 @@ export class Session {
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.rollbackPressure = 0;
         this.stalledPlayers = new Map();
+        this.syncRecoveryDeadlines = new Map();
         this.clientStallStartedAtMs = 0;
         this.consecutiveHashMismatches = new Map();
         this.pendingHashMessages = [];
@@ -308,6 +311,7 @@ export class Session {
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.rollbackPressure = 0;
         this.stalledPlayers.clear();
+        this.syncRecoveryDeadlines.clear();
         this.clientStallStartedAtMs = 0;
         this.consecutiveHashMismatches.clear();
 
@@ -334,6 +338,7 @@ export class Session {
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.rollbackPressure = 0;
         this.stalledPlayers.clear();
+        this.syncRecoveryDeadlines.clear();
         this.clientStallStartedAtMs = 0;
         this.consecutiveHashMismatches.clear();
 
@@ -429,6 +434,7 @@ export class Session {
             this.clientStallStartedAtMs = 0;
             if (this._isHost) {
                 this.stalledPlayers.clear();
+                this.syncRecoveryDeadlines.clear();
             }
             return;
         }
@@ -462,7 +468,17 @@ export class Session {
             if (player.role !== PlayerRole.Player) continue;
             if (player.connectionState !== PlayerConnectionState.Connected) {
                 this.stalledPlayers.delete(player.id);
+                this.syncRecoveryDeadlines.delete(player.id);
                 continue;
+            }
+
+            const recoveryDeadline = this.syncRecoveryDeadlines.get(player.id) ?? 0;
+            if (recoveryDeadline > now) {
+                this.stalledPlayers.delete(player.id);
+                continue;
+            }
+            if (recoveryDeadline !== 0) {
+                this.syncRecoveryDeadlines.delete(player.id);
             }
 
             const confirmedTick = this.engine.getConfirmedTickForPlayer(player.id);
@@ -470,6 +486,7 @@ export class Session {
 
             if (ticksBehind < this.config.maxSpeculationTicks) {
                 this.stalledPlayers.delete(player.id);
+                this.syncRecoveryDeadlines.delete(player.id);
                 continue;
             }
 
@@ -514,6 +531,7 @@ export class Session {
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.rollbackPressure = 0;
         this.stalledPlayers.clear();
+        this.syncRecoveryDeadlines.clear();
         this.clientStallStartedAtMs = 0;
         this.consecutiveHashMismatches.clear();
         this.emit('synced', state.tick);
@@ -639,6 +657,11 @@ export class Session {
     }
 
     handleInputMessage(message) {
+        if (this._isHost) {
+            this.stalledPlayers.delete(message.playerId);
+            this.syncRecoveryDeadlines.delete(message.playerId);
+        }
+
         for (const { tick, input } of message.inputs) {
             this.engine.receiveRemoteInput(message.playerId, tick, input);
         }
@@ -701,6 +724,7 @@ export class Session {
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.rollbackPressure = 0;
         this.stalledPlayers.clear();
+        this.syncRecoveryDeadlines.clear();
         this.clientStallStartedAtMs = 0;
         this.consecutiveHashMismatches.clear();
 
@@ -739,6 +763,9 @@ export class Session {
 
     handleSyncRequest(peerId, message) {
         if (!this._isHost) return;
+
+        this.stalledPlayers.delete(message.playerId);
+        this.syncRecoveryDeadlines.set(message.playerId, Date.now() + HOST_SYNC_RECOVERY_GRACE_MS);
 
         const state = this.engine.getState();
         for (const pt of state.playerTimeline) {
@@ -921,6 +948,8 @@ export class Session {
         if (!player) return;
 
         player.connectionState = PlayerConnectionState.Disconnected;
+        this.stalledPlayers.delete(playerId);
+        this.syncRecoveryDeadlines.delete(playerId);
 
         if (this._state === SessionState.Playing) {
             player.leaveTick = this.engine.currentTick;

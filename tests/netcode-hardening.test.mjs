@@ -674,6 +674,67 @@ test('Session only syncs the requesting peer after a sync request', async () => 
     session.destroy();
 });
 
+test('Host grants sync recovery grace before dropping a stalled peer', async () => {
+    const transport = new StubTransport('host');
+    const session = new Session({
+        game: {
+            step() { },
+            serialize() { return new Uint8Array([0]); },
+            deserialize() { },
+            hashSerialized(bytes) { return bytes[0] ?? 0; },
+        },
+        transport,
+        config: {
+            inputSizeBytes: 3,
+            snapshotHistorySize: 32,
+            maxSpeculationTicks: 3,
+            disconnectTimeout: 5000,
+        },
+    });
+
+    await session.createRoom();
+    session.setState(3);
+    session.playerManager.set('peer-a', {
+        id: 'peer-a',
+        name: 'Peer A',
+        connectionState: 1,
+        joinTick: 0,
+        leaveTick: null,
+        isHost: false,
+        role: 0,
+        rtt: 0,
+    });
+    session.engine.addPlayer('peer-a', 0);
+    session.engine._currentTick = 20;
+
+    let dropped = 0;
+    session.dropPlayer = () => {
+        dropped++;
+    };
+
+    const realDateNow = Date.now;
+    let now = 5_000;
+    Date.now = () => now;
+
+    try {
+        session.handleSyncRequest('peer-a', { playerId: 'peer-a' });
+        session.handleSpeculationStall({ stalled: true, tick: 20, speculation: 3 });
+        assert.equal(dropped, 0);
+
+        now += 3_100;
+        session.handleSpeculationStall({ stalled: true, tick: 20, speculation: 3 });
+        assert.equal(dropped, 0);
+
+        now += 5_100;
+        session.handleSpeculationStall({ stalled: true, tick: 20, speculation: 3 });
+        assert.equal(dropped, 1);
+    } finally {
+        Date.now = realDateNow;
+    }
+
+    session.destroy();
+});
+
 test('Session requires repeated hash mismatches before requesting a sync', async () => {
     const session = new Session({
         game: {
