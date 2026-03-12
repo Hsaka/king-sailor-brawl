@@ -7,7 +7,7 @@ import { Minimap } from '../game/Minimap.js';
 import { assetManager } from '../utils/AssetManager.js';
 import { HUD } from '../ui/HUD.js';
 import { WheelControl } from '../ui/WheelControl.js';
-import { SessionState } from '../netcode/index.js';
+import { SessionState, PlayerConnectionState } from '../netcode/index.js';
 
 let _buttons = [];
 function regBtn(x, y, w, h, id, cb) { _buttons.push({ x, y, w, h, id, cb }); }
@@ -42,10 +42,21 @@ export class GameScene {
         this._awaitingSync = false;
         this._lastSyncRequestAtMs = 0;
         this._sessionSyncHandler = null;
+        this._sessionInputDelayHandler = null;
+        this._sessionDesyncHandler = null;
+        this._sessionLagReportHandler = null;
+        this._sessionStateChangeHandler = null;
+        this._sessionErrorHandler = null;
         this._autoPausedForHidden = false;
         this._visibilityHandler = null;
         this.renderShipState = new Map();
         this.renderShips = new Map();
+        this.netDebug = this.createNetDebugState();
+        this.netDebugEnabled = this.resolveNetDebugEnabled();
+        this.telemetry = this.createTelemetryState();
+        this._lastPeerMetricsLogAtMs = 0;
+        this._telemetryNotice = '';
+        this._telemetryNoticeUntilMs = 0;
 
         // Wheel control scheme
         this.wheelControl = CONFIG.MOVEMENT.WHEEL_CONTROL_SCHEME ? new WheelControl() : null;
@@ -55,6 +66,239 @@ export class GameScene {
         if (this.wheelControl && !GameScene._joystickPatched) {
             GameScene._joystickPatched = true;
             GameScene._installJoystickPatch();
+        }
+    }
+
+    resolveNetDebugEnabled() {
+        const fromQuery = typeof window !== 'undefined' &&
+            typeof window.location?.search === 'string' &&
+            window.location.search.includes('netdebug=1');
+
+        let fromStorage = false;
+        try {
+            fromStorage = localStorage.getItem('netDebugOverlay') === '1';
+        } catch { }
+
+        return fromQuery || fromStorage;
+    }
+
+    createNetDebugState() {
+        const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        return {
+            sampleStartMs: now,
+            rollbacksInWindow: 0,
+            rollbackTicksInWindow: 0,
+            maxRollbackInWindow: 0,
+            rollbacksPerSec: 0,
+            rollbackTicksPerSec: 0,
+            maxRollbackTicks: 0,
+            totalRollbacks: 0,
+            totalRollbackTicks: 0,
+            syncEvents: 0,
+            syncRequests: 0,
+            desyncEvents: 0,
+            lagReports: 0,
+            lastSyncTick: -1,
+            lastDesyncTick: -1,
+            lastLaggyPlayerId: '',
+            lastLagTicksBehind: 0,
+            desiredTicks: 0,
+            ticksProcessed: 0,
+            catchUpClamped: false,
+            stalledTicks: 0,
+            inputDelayTicks: this.session?.inputDelayTicks ?? 0,
+            maxRttMs: 0,
+            maxJitterMs: 0,
+            worstTicksBehind: 0,
+            teleportSnapsLastFrame: 0,
+            rollbackSnapTeleportsLastFrame: 0,
+        };
+    }
+
+    createTelemetryState() {
+        const startPerfMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        return {
+            schema: 'ksb-net-telemetry/v1',
+            startedAtIso: new Date().toISOString(),
+            startPerfMs,
+            maxEvents: 50000,
+            droppedEvents: 0,
+            events: [],
+        };
+    }
+
+    safeClone(value) {
+        try {
+            return JSON.parse(JSON.stringify(value));
+        } catch {
+            return null;
+        }
+    }
+
+    getTelemetryNowMs() {
+        if (!this.telemetry) return 0;
+        const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        return Number((now - this.telemetry.startPerfMs).toFixed(3));
+    }
+
+    recordTelemetry(type, payload = {}) {
+        if (!this.telemetry) return;
+
+        const event = {
+            t: this.getTelemetryNowMs(),
+            type,
+            ...payload,
+        };
+
+        if (this.telemetry.events.length < this.telemetry.maxEvents) {
+            this.telemetry.events.push(event);
+        } else {
+            this.telemetry.droppedEvents++;
+        }
+    }
+
+    rollupNetDebugWindow(nowMs) {
+        const elapsedMs = nowMs - this.netDebug.sampleStartMs;
+        if (elapsedMs < 1000) return;
+
+        const elapsedSeconds = Math.max(0.001, elapsedMs / 1000);
+        this.netDebug.rollbacksPerSec = this.netDebug.rollbacksInWindow / elapsedSeconds;
+        this.netDebug.rollbackTicksPerSec = this.netDebug.rollbackTicksInWindow / elapsedSeconds;
+        this.netDebug.maxRollbackTicks = this.netDebug.maxRollbackInWindow;
+        this.netDebug.rollbacksInWindow = 0;
+        this.netDebug.rollbackTicksInWindow = 0;
+        this.netDebug.maxRollbackInWindow = 0;
+        this.netDebug.sampleStartMs = nowMs;
+    }
+
+    sampleTransportDiagnostics() {
+        let maxRttMs = 0;
+        let maxJitterMs = 0;
+        const transport = this.session?.transport;
+
+        if (transport?.connectedPeers) {
+            for (const peerId of transport.connectedPeers) {
+                const metrics = transport.getConnectionMetrics?.(peerId);
+                if (!metrics) continue;
+                maxRttMs = Math.max(maxRttMs, metrics.rtt || 0);
+                maxJitterMs = Math.max(maxJitterMs, metrics.jitter || 0);
+            }
+        }
+
+        let worstTicksBehind = 0;
+        if (this.session?.playerManager) {
+            for (const player of this.session.playerManager.values()) {
+                if (player.id === this.session.localPlayerId) continue;
+                if (player.connectionState !== PlayerConnectionState.Connected) continue;
+
+                const confirmedTick = this.session.engine?.getConfirmedTickForPlayer(player.id);
+                if (confirmedTick === undefined) continue;
+
+                const ticksBehind = Math.max(0, this.session.currentTick - confirmedTick);
+                worstTicksBehind = Math.max(worstTicksBehind, ticksBehind);
+            }
+        }
+
+        this.netDebug.maxRttMs = maxRttMs;
+        this.netDebug.maxJitterMs = maxJitterMs;
+        this.netDebug.worstTicksBehind = worstTicksBehind;
+        this.netDebug.inputDelayTicks = this.session?.inputDelayTicks ?? this.netDebug.inputDelayTicks;
+    }
+
+    maybeLogPeerMetrics(nowMs) {
+        if (nowMs - this._lastPeerMetricsLogAtMs < 500) return;
+        this._lastPeerMetricsLogAtMs = nowMs;
+
+        const peers = [];
+        const transport = this.session?.transport;
+        if (transport?.connectedPeers) {
+            for (const peerId of transport.connectedPeers) {
+                const metrics = transport.getConnectionMetrics?.(peerId);
+                const confirmedTick = this.session?.engine?.getConfirmedTickForPlayer?.(peerId);
+                peers.push({
+                    peerId,
+                    rttMs: Number((metrics?.rtt || 0).toFixed(2)),
+                    jitterMs: Number((metrics?.jitter || 0).toFixed(2)),
+                    packetLoss: Number((metrics?.packetLoss || 0).toFixed(4)),
+                    confirmedTick: confirmedTick ?? null,
+                    ticksBehind: confirmedTick === undefined ? null : Math.max(0, this.session.currentTick - confirmedTick),
+                });
+            }
+        }
+
+        this.recordTelemetry('peer_metrics', {
+            currentTick: this.session?.currentTick ?? -1,
+            peers,
+        });
+    }
+
+    trackSyncRequest(reason = 'unknown') {
+        this.netDebug.syncRequests++;
+        this.recordTelemetry('sync_request', {
+            reason,
+            currentTick: this.session ? this.session.currentTick : -1,
+            awaitingSync: this._awaitingSync,
+        });
+    }
+
+    downloadTelemetry(trigger = 'manual') {
+        if (!this.session || !this.telemetry) return;
+        this.recordTelemetry('telemetry_export_requested', {
+            trigger,
+            currentTick: this.session.currentTick,
+        });
+
+        const payload = {
+            schema: this.telemetry.schema,
+            startedAtIso: this.telemetry.startedAtIso,
+            exportedAtIso: new Date().toISOString(),
+            session: {
+                localPlayerId: this.session.localPlayerId,
+                roomId: this.session.roomId,
+                isHost: this.session.isHost,
+                state: this.session.state,
+                currentTick: this.session.currentTick,
+                confirmedTick: this.session.confirmedTick,
+            },
+            config: this.safeClone(this.session.config),
+            netDebug: this.safeClone(this.netDebug),
+            telemetry: {
+                droppedEvents: this.telemetry.droppedEvents,
+                eventCount: this.telemetry.events.length,
+                events: this.telemetry.events,
+            },
+        };
+
+        try {
+            const text = JSON.stringify(payload, null, 2);
+            const blob = new Blob([text], { type: 'application/json' });
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const localId = (this.session.localPlayerId || 'player').slice(0, 8);
+            const filename = `ksb-net-telemetry-${timestamp}-${localId}.json`;
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+            this._telemetryNotice = `Saved ${filename}`;
+            this._telemetryNoticeUntilMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + 4000;
+            this.recordTelemetry('telemetry_exported', {
+                trigger,
+                filename,
+                eventCount: this.telemetry.events.length,
+                droppedEvents: this.telemetry.droppedEvents,
+            });
+        } catch (error) {
+            this._telemetryNotice = 'Telemetry export failed';
+            this._telemetryNoticeUntilMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) + 4000;
+            this.recordTelemetry('telemetry_export_failed', {
+                trigger,
+                error: error instanceof Error ? error.message : String(error),
+            });
         }
     }
 
@@ -137,19 +381,97 @@ export class GameScene {
         this._lastSyncRequestAtMs = 0;
         this.renderShipState.clear();
         this.renderShips.clear();
+        this.netDebug = this.createNetDebugState();
+        this.telemetry = this.createTelemetryState();
+        this._lastPeerMetricsLogAtMs = 0;
+        this._telemetryNotice = '';
+        this._telemetryNoticeUntilMs = 0;
+        this.recordTelemetry('scene_enter', {
+            localPlayerId: this.session.localPlayerId,
+            roomId: this.session.roomId,
+            isHost: this.session.isHost,
+            state: this.session.state,
+            config: this.safeClone(this.session.config),
+        });
 
         if (!this._visibilityHandler) {
             this._visibilityHandler = () => this.onVisibilityChange();
             document.addEventListener('visibilitychange', this._visibilityHandler);
         }
         if (!this._sessionSyncHandler) {
-            this._sessionSyncHandler = () => {
+            this._sessionSyncHandler = (tick) => {
+                this.netDebug.syncEvents++;
+                this.netDebug.lastSyncTick = tick ?? (this.session ? this.session.currentTick : -1);
+                this.recordTelemetry('synced', {
+                    tick: this.netDebug.lastSyncTick,
+                    currentTick: this.session ? this.session.currentTick : -1,
+                });
                 this._awaitingSync = false;
                 this._hadRollbackThisUpdate = false;
                 this.resetSimulationClock(this.session ? this.session.currentTick : 0);
+                this.renderShipState.clear();
+                this.renderShips.clear();
                 this.syncWheelHeadingToLocal();
             };
             this.session.on('synced', this._sessionSyncHandler);
+        }
+        if (!this._sessionInputDelayHandler) {
+            this._sessionInputDelayHandler = (delayTicks) => {
+                this.netDebug.inputDelayTicks = delayTicks;
+                this.recordTelemetry('input_delay_changed', {
+                    delayTicks,
+                    currentTick: this.session ? this.session.currentTick : -1,
+                });
+            };
+            this.session.on('inputDelayChanged', this._sessionInputDelayHandler);
+        }
+        if (!this._sessionDesyncHandler) {
+            this._sessionDesyncHandler = (tick, localHash, remoteHash) => {
+                this.netDebug.desyncEvents++;
+                this.netDebug.lastDesyncTick = tick;
+                this.recordTelemetry('desync', {
+                    tick,
+                    localHash,
+                    remoteHash,
+                    currentTick: this.session ? this.session.currentTick : -1,
+                });
+            };
+            this.session.on('desync', this._sessionDesyncHandler);
+        }
+        if (!this._sessionLagReportHandler) {
+            this._sessionLagReportHandler = (laggyPlayerId, ticksBehind) => {
+                this.netDebug.lagReports++;
+                this.netDebug.lastLaggyPlayerId = laggyPlayerId;
+                this.netDebug.lastLagTicksBehind = ticksBehind;
+                this.recordTelemetry('lag_report', {
+                    laggyPlayerId,
+                    ticksBehind,
+                    currentTick: this.session ? this.session.currentTick : -1,
+                });
+            };
+            this.session.on('lagReport', this._sessionLagReportHandler);
+        }
+        if (!this._sessionStateChangeHandler) {
+            this._sessionStateChangeHandler = (newState, oldState) => {
+                this.recordTelemetry('state_change', {
+                    oldState,
+                    newState,
+                    currentTick: this.session ? this.session.currentTick : -1,
+                });
+            };
+            this.session.on('stateChange', this._sessionStateChangeHandler);
+        }
+        if (!this._sessionErrorHandler) {
+            this._sessionErrorHandler = (error, meta) => {
+                this.recordTelemetry('session_error', {
+                    message: error instanceof Error ? error.message : String(error),
+                    source: meta?.source ?? null,
+                    recoverable: meta?.recoverable ?? null,
+                    details: this.safeClone(meta?.details),
+                    currentTick: this.session ? this.session.currentTick : -1,
+                });
+            };
+            this.session.on('error', this._sessionErrorHandler);
         }
         const local = this.worldState.players.get(this.worldState.localPlayerId);
         if (local) {
@@ -176,6 +498,7 @@ export class GameScene {
         if (!this.session) return;
 
         if (document.visibilityState === 'hidden') {
+            this.recordTelemetry('visibility', { state: 'hidden', currentTick: this.session.currentTick });
             if (this.session.isHost && this.session.state === SessionState.Playing) {
                 this._autoPausedForHidden = true;
                 try {
@@ -185,8 +508,11 @@ export class GameScene {
             return;
         }
 
+        this.recordTelemetry('visibility', { state: 'visible', currentTick: this.session.currentTick });
+
         if (this.session.isHost) {
             if (this._autoPausedForHidden && this.session.state === SessionState.Paused) {
+                this.recordTelemetry('visibility_resume_host', { action: 'sync_resume', currentTick: this.session.currentTick });
                 this.session.syncState?.();
                 this.session.resume();
             }
@@ -194,6 +520,7 @@ export class GameScene {
         } else if (this.session.state === SessionState.Playing || this.session.state === SessionState.Paused) {
             this._awaitingSync = true;
             this._lastSyncRequestAtMs = performance.now();
+            this.trackSyncRequest('visibility_resume');
             this.session.requestSync?.();
         }
 
@@ -290,6 +617,8 @@ export class GameScene {
     updateRenderShipState() {
         const localId = this.worldState.localPlayerId;
         const hadRollback = this._hadRollbackThisUpdate;
+        let teleportSnaps = 0;
+        let rollbackSnapTeleports = 0;
 
         for (const [id, pdata] of this.worldState.players) {
             const isLocal = id === localId;
@@ -306,9 +635,12 @@ export class GameScene {
             const dx = pdata.x - smooth.x;
             const dy = pdata.y - smooth.y;
             const dist = Math.hypot(dx, dy);
-            const teleported = dist > 220 || pdata.alive !== smooth.alive;
+            const rollbackJump = hadRollback && dist > 60;
+            const teleported = dist > 220 || rollbackJump || pdata.alive !== smooth.alive;
 
             if (teleported) {
+                teleportSnaps++;
+                if (rollbackJump) rollbackSnapTeleports++;
                 smooth.x = pdata.x;
                 smooth.y = pdata.y;
                 smooth.heading = pdata.heading;
@@ -350,24 +682,67 @@ export class GameScene {
                 this.renderShips.delete(id);
             }
         }
+
+        this.netDebug.teleportSnapsLastFrame = teleportSnaps;
+        this.netDebug.rollbackSnapTeleportsLastFrame = rollbackSnapTeleports;
+        if (teleportSnaps > 0) {
+            this.recordTelemetry('render_snap', {
+                teleportSnaps,
+                rollbackSnapTeleports,
+                hadRollback,
+                currentTick: this.session ? this.session.currentTick : -1,
+            });
+        }
     }
 
     onUpdate() {
         if (!this.session) return;
+        if (keyWasPressed('F3')) {
+            this.netDebugEnabled = !this.netDebugEnabled;
+            try {
+                localStorage.setItem('netDebugOverlay', this.netDebugEnabled ? '1' : '0');
+            } catch { }
+            this.recordTelemetry('net_debug_toggled', { enabled: this.netDebugEnabled });
+        }
+        if (keyWasPressed('F4')) {
+            this.downloadTelemetry('hotkey_f4');
+        }
 
         if (!this.session.isHost && this._awaitingSync) {
             const nowMs = performance.now();
             if (nowMs - this._lastSyncRequestAtMs > 600) {
+                this.trackSyncRequest('awaiting_sync_retry');
                 this.session.requestSync?.();
                 this._lastSyncRequestAtMs = nowMs;
             }
+            this.netDebug.desiredTicks = Math.max(0, this.getDesiredCurrentTick(nowMs) - this.session.currentTick);
+            this.netDebug.ticksProcessed = 0;
+            this.netDebug.catchUpClamped = false;
+            this.sampleTransportDiagnostics();
+            this.rollupNetDebugWindow(nowMs);
+            this.recordTelemetry('frame', {
+                phase: 'awaiting_sync',
+                currentTick: this.session.currentTick,
+                confirmedTick: this.session.confirmedTick,
+                desiredTicks: this.netDebug.desiredTicks,
+                ticksProcessed: 0,
+                catchUpClamped: false,
+                inputDelayTicks: this.netDebug.inputDelayTicks,
+                worstTicksBehind: this.netDebug.worstTicksBehind,
+                maxRttMs: Number(this.netDebug.maxRttMs.toFixed(2)),
+                maxJitterMs: Number(this.netDebug.maxJitterMs.toFixed(2)),
+            });
+            this.maybeLogPeerMetrics(nowMs);
             this.updateRenderShipState();
             return;
         }
 
         const now = performance.now();
         const desiredCurrentTick = this.getDesiredCurrentTick(now);
-        let ticksToProcess = Math.max(0, desiredCurrentTick - this.session.currentTick);
+        const desiredTicks = Math.max(0, desiredCurrentTick - this.session.currentTick);
+        let ticksToProcess = desiredTicks;
+        this.netDebug.desiredTicks = desiredTicks;
+        this.netDebug.catchUpClamped = false;
 
         const dynamicMaxCatchUp = this.session?.isHost
             ? Math.max(this.maxCatchUpTicksPerFrame, Math.floor(this.maxCatchUpTicksPerFrame * 1.5))
@@ -376,31 +751,91 @@ export class GameScene {
         if (ticksToProcess > dynamicMaxCatchUp) {
             const lagTicks = ticksToProcess - dynamicMaxCatchUp;
             ticksToProcess = dynamicMaxCatchUp;
+            this.netDebug.catchUpClamped = true;
+            this.recordTelemetry('catchup_clamped', {
+                desiredTicks,
+                maxCatchUp: dynamicMaxCatchUp,
+                lagTicks,
+                currentTick: this.session.currentTick,
+            });
 
             // If we're severely behind wall-clock, rebase to prevent endless saturation.
             if (lagTicks > dynamicMaxCatchUp * 3) {
+                this.recordTelemetry('sim_clock_rebase', {
+                    reason: 'severe_catchup_lag',
+                    lagTicks,
+                    dynamicMaxCatchUp,
+                    fromTick: this.session.currentTick,
+                    toTick: this.session.currentTick + ticksToProcess,
+                });
                 this.resetSimulationClock(this.session.currentTick + ticksToProcess);
             }
         }
 
         this._hadRollbackThisUpdate = false;
+        let ticksProcessed = 0;
+        let frameRollbacks = 0;
+        let frameRollbackTicks = 0;
+        let frameStalledTicks = 0;
         for (let i = 0; i < ticksToProcess; i++) {
             const tickBefore = this.session.currentTick;
             const input = this.updateLocalInput();
             const result = this.session.tick(input);
-            if (result?.rolledBack) this._hadRollbackThisUpdate = true;
+            ticksProcessed++;
 
+            if (result?.rolledBack) this._hadRollbackThisUpdate = true;
+            if (result?.rolledBack) {
+                const rollbackTicks = Math.max(1, result.rollbackTicks ?? 1);
+                frameRollbacks++;
+                frameRollbackTicks += rollbackTicks;
+                this.netDebug.rollbacksInWindow++;
+                this.netDebug.rollbackTicksInWindow += rollbackTicks;
+                this.netDebug.maxRollbackInWindow = Math.max(this.netDebug.maxRollbackInWindow, rollbackTicks);
+                this.netDebug.totalRollbacks++;
+                this.netDebug.totalRollbackTicks += rollbackTicks;
+                this.recordTelemetry('rollback', {
+                    tick: result.tick ?? tickBefore,
+                    rollbackTicks,
+                    currentTick: this.session.currentTick,
+                    confirmedTick: this.session.confirmedTick,
+                });
+            }
             if (this.session.currentTick === tickBefore) {
-                // The rollback engine can temporarily refuse to advance when the
-                // speculation window is exhausted. Rebase the wall-clock anchor
-                // so we avoid accumulating a large catch-up burst when inputs
-                // resume.
-                this.resetSimulationClock(this.session.currentTick);
-                break;
+                this.netDebug.stalledTicks++;
+                frameStalledTicks++;
+                this.recordTelemetry('tick_stalled', {
+                    tick: tickBefore,
+                    desiredTicks,
+                    iteration: i,
+                    confirmedTick: this.session.confirmedTick,
+                });
             }
         }
-
+        this.netDebug.ticksProcessed = ticksProcessed;
+        this.sampleTransportDiagnostics();
+        this.rollupNetDebugWindow(now);
         this.updateRenderShipState();
+
+        this.recordTelemetry('frame', {
+            phase: 'active',
+            currentTick: this.session.currentTick,
+            confirmedTick: this.session.confirmedTick,
+            desiredTicks,
+            ticksToProcess,
+            ticksProcessed,
+            catchUpClamped: this.netDebug.catchUpClamped,
+            hadRollback: this._hadRollbackThisUpdate,
+            rollbacks: frameRollbacks,
+            rollbackTicks: frameRollbackTicks,
+            stalledTicks: frameStalledTicks,
+            inputDelayTicks: this.netDebug.inputDelayTicks,
+            worstTicksBehind: this.netDebug.worstTicksBehind,
+            maxRttMs: Number(this.netDebug.maxRttMs.toFixed(2)),
+            maxJitterMs: Number(this.netDebug.maxJitterMs.toFixed(2)),
+            teleportSnaps: this.netDebug.teleportSnapsLastFrame,
+            rollbackSnapTeleports: this.netDebug.rollbackSnapTeleportsLastFrame,
+        });
+        this.maybeLogPeerMetrics(now);
 
         // Update camera targeting smoothly
         let focusId = this.worldState.localPlayerId;
@@ -624,6 +1059,10 @@ export class GameScene {
             drawScreenText('SPECTATING: ' + specName + ' (FIRE to cycle)', cx, 100 * s, 24 * s, '#FFF', 'center');
         }
 
+        if (this.netDebugEnabled) {
+            this.drawNetDebugOverlay(sw, s);
+        }
+
         // drawScreenText('Tick: ' + this.session.currentTick, cx, 30 * s, 14 * s, '#FFF', 'center');
 
         this.hud.render(c, s, this.worldState, renderFocusId);
@@ -697,9 +1136,73 @@ export class GameScene {
             switchScene('menu');
         });
 
+        const exportBtnW = 150 * s;
+        const exportBtnX = padding + btnW + 12 * s;
+        draw3DButton(exportBtnX, padding, exportBtnW, 40 * s, 'Export Log', CONFIG.UI.COLORS.WARNING, false, this._hovered?.id === 'export_log');
+        regBtn(exportBtnX, padding, exportBtnW, 40 * s, 'export_log', () => {
+            this.downloadTelemetry('ui_button');
+        });
+
+        const nowMs = performance.now();
+        if (this._telemetryNotice && nowMs <= this._telemetryNoticeUntilMs) {
+            drawScreenText(this._telemetryNotice, exportBtnX + exportBtnW / 2, padding + 52 * s, 12 * s, '#FFF', 'center', 'middle', 'Arial', true);
+        }
+
+    }
+
+    drawNetDebugOverlay(sw, s) {
+        const dbg = this.netDebug;
+        const localAhead = Math.max(0, this.session.currentTick - (this.session.confirmedTick + 1));
+        const lines = [
+            'NET DEBUG (F3)',
+            `tick cur/conf ${this.session.currentTick}/${this.session.confirmedTick}  ahead ${localAhead}`,
+            `desired/proc ${dbg.desiredTicks}/${dbg.ticksProcessed}  clamp ${dbg.catchUpClamped ? 'Y' : 'N'}`,
+            `rb/s ${dbg.rollbacksPerSec.toFixed(1)}  rbTicks/s ${dbg.rollbackTicksPerSec.toFixed(1)}  maxRb ${dbg.maxRollbackTicks}`,
+            `totRb ${dbg.totalRollbacks}  totRbTicks ${dbg.totalRollbackTicks}  stallTicks ${dbg.stalledTicks}`,
+            `snaps tele ${dbg.teleportSnapsLastFrame}  rbTele ${dbg.rollbackSnapTeleportsLastFrame}`,
+            `inputDelay ${dbg.inputDelayTicks}t  worstBehind ${dbg.worstTicksBehind}t`,
+            `maxRTT ${Math.round(dbg.maxRttMs)}ms  maxJitter ${Math.round(dbg.maxJitterMs)}ms`,
+            `sync ${dbg.syncEvents} (req ${dbg.syncRequests}) lastSync ${dbg.lastSyncTick}`,
+            `desync ${dbg.desyncEvents} last ${dbg.lastDesyncTick} lagReports ${dbg.lagReports}`,
+        ];
+        if (dbg.lastLaggyPlayerId) {
+            lines.push(`lastLag ${dbg.lastLaggyPlayerId.slice(0, 8)} ${dbg.lastLagTicksBehind}t`);
+        }
+
+        const lineHeight = 15 * s;
+        const textSize = 12 * s;
+        const padding = 10 * s;
+        const panelWidth = 430 * s;
+        const panelHeight = padding * 2 + lineHeight * lines.length;
+        const x = sw - panelWidth - 18 * s;
+        const y = 70 * s;
+
+        drawRoundRect(
+            x, y, panelWidth, panelHeight, 10 * s,
+            'rgba(8, 12, 22, 0.78)',
+            'rgba(255, 255, 255, 0.22)',
+            Math.max(1, 1.5 * s)
+        );
+
+        for (let i = 0; i < lines.length; i++) {
+            drawScreenText(
+                lines[i],
+                x + padding,
+                y + padding + (i + 0.5) * lineHeight,
+                textSize,
+                '#E6F0FF',
+                'left',
+                'middle',
+                'monospace'
+            );
+        }
     }
 
     onExit() {
+        this.recordTelemetry('scene_exit', {
+            currentTick: this.session ? this.session.currentTick : -1,
+            confirmedTick: this.session ? this.session.confirmedTick : -1,
+        });
         if (this._visibilityHandler) {
             document.removeEventListener('visibilitychange', this._visibilityHandler);
             this._visibilityHandler = null;
@@ -707,6 +1210,26 @@ export class GameScene {
         if (this._sessionSyncHandler && this.session) {
             this.session.off('synced', this._sessionSyncHandler);
             this._sessionSyncHandler = null;
+        }
+        if (this._sessionInputDelayHandler && this.session) {
+            this.session.off('inputDelayChanged', this._sessionInputDelayHandler);
+            this._sessionInputDelayHandler = null;
+        }
+        if (this._sessionDesyncHandler && this.session) {
+            this.session.off('desync', this._sessionDesyncHandler);
+            this._sessionDesyncHandler = null;
+        }
+        if (this._sessionLagReportHandler && this.session) {
+            this.session.off('lagReport', this._sessionLagReportHandler);
+            this._sessionLagReportHandler = null;
+        }
+        if (this._sessionStateChangeHandler && this.session) {
+            this.session.off('stateChange', this._sessionStateChangeHandler);
+            this._sessionStateChangeHandler = null;
+        }
+        if (this._sessionErrorHandler && this.session) {
+            this.session.off('error', this._sessionErrorHandler);
+            this._sessionErrorHandler = null;
         }
         this.renderShipState.clear();
         this.renderShips.clear();
