@@ -625,19 +625,25 @@ export class Session {
     handleSyncRequest(message) {
         if (!this._isHost) return;
 
+        const requester = this.playerManager.get(message.playerId);
+        if (!requester || requester.connectionState !== PlayerConnectionState.Connected) {
+            return;
+        }
+
         const state = this.engine.getState();
         for (const pt of state.playerTimeline) {
             const p = this.playerManager.get(pt.playerId);
             if (p) pt.name = p.name;
         }
         const syncMsg = createSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline);
-        this.broadcast(syncMsg, true);
-        this.engine.resetForSync(state.tick, state.playerTimeline);
-        this.pendingHashMessages = [];
-        this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
-        this.lastAdaptiveDelayUpdateTick = asTick(-1);
-        this.rollbackPressure = 0;
-        this.emit('synced', state.tick);
+
+        // Sync only the requesting peer. Broadcasting and resetting the host's
+        // buffers here causes avoidable visual snaps for unaffected players.
+        this.transport.send(
+            playerIdToPeerId(message.playerId),
+            encodeMessage(syncMsg),
+            true
+        );
     }
 
     handleJoinRequest(peerId, message) {

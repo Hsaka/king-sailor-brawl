@@ -147,8 +147,6 @@ export class GameScene {
                 this._awaitingSync = false;
                 this._hadRollbackThisUpdate = false;
                 this.resetSimulationClock(this.session ? this.session.currentTick : 0);
-                this.renderShipState.clear();
-                this.renderShips.clear();
                 this.syncWheelHeadingToLocal();
             };
             this.session.on('synced', this._sessionSyncHandler);
@@ -308,8 +306,7 @@ export class GameScene {
             const dx = pdata.x - smooth.x;
             const dy = pdata.y - smooth.y;
             const dist = Math.hypot(dx, dy);
-            const rollbackJump = hadRollback && dist > 60;
-            const teleported = dist > 220 || rollbackJump || pdata.alive !== smooth.alive;
+            const teleported = dist > 220 || pdata.alive !== smooth.alive;
 
             if (teleported) {
                 smooth.x = pdata.x;
@@ -388,9 +385,19 @@ export class GameScene {
 
         this._hadRollbackThisUpdate = false;
         for (let i = 0; i < ticksToProcess; i++) {
+            const tickBefore = this.session.currentTick;
             const input = this.updateLocalInput();
             const result = this.session.tick(input);
             if (result?.rolledBack) this._hadRollbackThisUpdate = true;
+
+            if (this.session.currentTick === tickBefore) {
+                // The rollback engine can temporarily refuse to advance when the
+                // speculation window is exhausted. Rebase the wall-clock anchor
+                // so we avoid accumulating a large catch-up burst when inputs
+                // resume.
+                this.resetSimulationClock(this.session.currentTick);
+                break;
+            }
         }
 
         this.updateRenderShipState();
