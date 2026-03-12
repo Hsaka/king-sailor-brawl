@@ -480,6 +480,56 @@ test('Session surfaces transport errors through session error events', async () 
     session.destroy();
 });
 
+test('Session emits syncRequested even when sync send is cooldown-limited', async () => {
+    const transport = new StubTransport('client-peer');
+    const session = new Session({
+        game: {
+            step() { },
+            serialize() { return new Uint8Array([0]); },
+            deserialize() { },
+            hashSerialized(bytes) { return bytes[0] ?? 0; },
+        },
+        transport,
+        config: {
+            inputSizeBytes: 3,
+            snapshotHistorySize: 32,
+            maxSpeculationTicks: 16,
+        },
+    });
+
+    session.playerManager.set('host-peer', {
+        id: 'host-peer',
+        name: 'Host',
+        connectionState: 1,
+        joinTick: null,
+        leaveTick: null,
+        isHost: true,
+        role: 0,
+        rtt: 0,
+    });
+
+    const seen = [];
+    session.on('syncRequested', (payload) => {
+        seen.push(payload);
+    });
+
+    const realDateNow = Date.now;
+    let now = 2_000;
+    Date.now = () => now;
+
+    try {
+        session.requestSync();
+        session.requestSync();
+    } finally {
+        Date.now = realDateNow;
+    }
+
+    assert.equal(seen.length, 2);
+    assert.equal(transport.sent.length, 1);
+    assert.equal(transport.sent[0].peerId, 'host-peer');
+    session.destroy();
+});
+
 test('Session accepts host-relayed input messages in star topology', async () => {
     const game = {
         step() { },

@@ -485,6 +485,10 @@ export class Session {
 
     requestSync() {
         if (this._isHost) return;
+        this.emit('syncRequested', {
+            tick: this.engine.currentTick,
+            localHash: this.engine.getCurrentHash(),
+        });
         const now = Date.now();
         if (now - this.lastSyncRequestAtMs < this.syncRequestCooldownMs) return;
         this.lastSyncRequestAtMs = now;

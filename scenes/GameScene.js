@@ -42,6 +42,7 @@ export class GameScene {
         this._awaitingSync = false;
         this._lastSyncRequestAtMs = 0;
         this._sessionSyncHandler = null;
+        this._sessionSyncRequestedHandler = null;
         this._autoPausedForHidden = false;
         this._visibilityHandler = null;
         this._networkStepTimer = null;
@@ -160,6 +161,15 @@ export class GameScene {
                 this.syncWheelHeadingToLocal();
             };
             this.session.on('synced', this._sessionSyncHandler);
+        }
+        if (!this._sessionSyncRequestedHandler) {
+            this._sessionSyncRequestedHandler = () => {
+                if (!this.session || this.session.isHost) return;
+                this._awaitingSync = true;
+                this._lastSyncRequestAtMs = performance.now();
+                this.resetNetworkSimulationClock();
+            };
+            this.session.on('syncRequested', this._sessionSyncRequestedHandler);
         }
         const local = this.worldState.players.get(this.worldState.localPlayerId);
         if (local) {
@@ -875,6 +885,10 @@ export class GameScene {
         if (this._sessionSyncHandler && this.session) {
             this.session.off('synced', this._sessionSyncHandler);
             this._sessionSyncHandler = null;
+        }
+        if (this._sessionSyncRequestedHandler && this.session) {
+            this.session.off('syncRequested', this._sessionSyncRequestedHandler);
+            this._sessionSyncRequestedHandler = null;
         }
         this.stopNetworkSimulationLoop();
         this.simRenderState.clear();
