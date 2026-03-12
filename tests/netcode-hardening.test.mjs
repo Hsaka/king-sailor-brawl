@@ -215,6 +215,50 @@ test('WorldState step normalizes authoritative simulation floats to float32', ()
     assert.equal(updatedDebris.duration, Math.fround(updatedDebris.duration));
 });
 
+test('WorldState resolves near-zero ship overlap with a deterministic collision normal', () => {
+    const worldA = createWorldStateWithPlayers(['p1', 'p2']);
+    const worldB = createWorldStateWithPlayers(['p1', 'p2']);
+
+    const configureOverlap = (world, separationX) => {
+        const p1 = world.players.get('p1');
+        const p2 = world.players.get('p2');
+
+        p1.shipId = 'cobro';
+        p2.shipId = 'cobro';
+        p1.x = 1000;
+        p1.y = 1000;
+        p2.x = 1000 + separationX;
+        p2.y = 1000;
+        p1.heading = 0;
+        p2.heading = 0;
+        p1.speedTier = 1;
+        p2.speedTier = 1;
+        p1.health = 100;
+        p2.health = 100;
+        p1.alive = true;
+        p2.alive = true;
+        p1.invincibilityTimer = 0;
+        p2.invincibilityTimer = 0;
+        p1.slowTimer = 0;
+        p2.slowTimer = 0;
+        p1.cooldowns = [0, 0, 0, 0, 0];
+        p2.cooldowns = [0, 0, 0, 0, 0];
+        p1.knockbackX = 0;
+        p1.knockbackY = 0;
+        p2.knockbackX = 0;
+        p2.knockbackY = 0;
+    };
+
+    configureOverlap(worldA, 1e-7);
+    configureOverlap(worldB, -1e-7);
+
+    worldA.step(new Map());
+    worldB.step(new Map());
+
+    assert.equal(Buffer.compare(Buffer.from(worldA.serialize()), Buffer.from(worldB.serialize())), 0);
+    assert.equal(worldA.hash(), worldB.hash());
+});
+
 test('RollbackEngine converges after delayed remote inputs', () => {
     const worldA = new DeterministicRollbackGame(['p1', 'p2']);
     const worldB = new DeterministicRollbackGame(['p1', 'p2']);

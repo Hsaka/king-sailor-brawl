@@ -4,6 +4,7 @@ import { CONFIG } from '../config.js';
 
 const HASH_FLOAT_SCALE = 100;
 const HASH_TEXT_ENCODER = new TextEncoder();
+const COLLISION_NORMAL_EPSILON_SQ = 1;
 
 export class WorldState {
     constructor() {
@@ -203,6 +204,14 @@ export class WorldState {
         for (const debris of this.debris) {
             this.normalizeDebrisState(debris);
         }
+    }
+
+    getDeterministicCollisionNormal(playerA, playerB) {
+        const slotA = Number.isInteger(playerA?.slot) ? playerA.slot : 0;
+        const slotB = Number.isInteger(playerB?.slot) ? playerB.slot : 0;
+        return ((slotA + slotB) & 1) === 0
+            ? { nx: 1, ny: 0 }
+            : { nx: 0, ny: 1 };
     }
 
     hashPlayerState(hash, id, player, lastInput) {
@@ -583,6 +592,9 @@ export class WorldState {
             if (pdata.slowTimer > 0) {
                 pdata.slowTimer = Math.max(0, pdata.slowTimer - dt);
             }
+
+            // Canonicalize per-player movement output before any branchy combat/collision checks.
+            this.normalizePlayerState(pdata);
         }
 
         // Check if match ended
@@ -613,6 +625,8 @@ export class WorldState {
                     pdata.cooldowns[i] = Math.max(0, pdata.cooldowns[i] - dt);
                 }
             }
+
+            this.normalizePlayerState(pdata);
 
             const readyToFire = pdata.cooldowns.map(cd => cd === 0);
 
@@ -784,10 +798,12 @@ export class WorldState {
                 const rSum = def1.hitboxRadius + def2.hitboxRadius;
 
                 if (distSq < rSum * rSum) {
-                    const dist = Math.sqrt(distSq) || 1;
+                    const useDeterministicNormal = distSq <= COLLISION_NORMAL_EPSILON_SQ;
+                    const dist = useDeterministicNormal ? 0 : Math.sqrt(distSq);
                     const overlap = rSum - dist;
-                    const nx = dx / dist;
-                    const ny = dy / dist;
+                    const { nx, ny } = useDeterministicNormal
+                        ? this.getDeterministicCollisionNormal(p1, p2)
+                        : { nx: dx / dist, ny: dy / dist };
 
                     // Simple push-apart
                     p1.x -= nx * overlap * 0.5;
