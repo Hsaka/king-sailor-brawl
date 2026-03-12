@@ -56,6 +56,7 @@ export class Session {
         this.lastSyncRequestAtMs = 0;
         this.syncRequestCooldownMs = 500;
         this.rollbackPressure = 0;
+        this.inputEpoch = 0;
 
         this.engine = this.createEngine();
 
@@ -215,6 +216,7 @@ export class Session {
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.rollbackPressure = 0;
+        this.inputEpoch = 0;
         this.pendingHashMessages = [];
         this.engine = this.createEngine();
     }
@@ -285,6 +287,7 @@ export class Session {
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.rollbackPressure = 0;
+        this.inputEpoch = 0;
 
         this.playerManager.set(this._localPlayerId, {
             id: this.localPlayerId,
@@ -308,6 +311,7 @@ export class Session {
         this.lastAdaptiveDelayUpdateTick = asTick(-1);
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
         this.rollbackPressure = 0;
+        this.inputEpoch = 0;
 
         const startTick = asTick(0);
         for (const player of this.playerManager.values()) {
@@ -322,7 +326,7 @@ export class Session {
             const p = this.playerManager.get(pt.playerId);
             if (p) pt.name = p.name;
         }
-        this.broadcast(createStateSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline), true);
+        this.broadcast(createStateSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline, this.inputEpoch), true);
 
         this.setState(SessionState.Playing);
         this.emit('gameStart');
@@ -407,12 +411,14 @@ export class Session {
         if (!this._isHost) return;
         if (this._state !== SessionState.Playing && this._state !== SessionState.Paused) return;
 
+        this.advanceInputEpoch();
+
         const state = this.engine.getState();
         for (const pt of state.playerTimeline) {
             const p = this.playerManager.get(pt.playerId);
             if (p) pt.name = p.name;
         }
-        const syncMsg = createSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline);
+        const syncMsg = createSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline, this.inputEpoch);
         this.broadcast(syncMsg, true);
 
         // Keep host internals aligned with the same sync baseline it just sent.
@@ -535,6 +541,17 @@ export class Session {
     }
 
     handleInputMessage(message) {
+        const messageEpoch = message.inputEpoch ?? 0;
+        if (messageEpoch !== this.inputEpoch) {
+            this.emit('staleInputDropped', {
+                playerId: message.playerId,
+                inputEpoch: messageEpoch,
+                expectedEpoch: this.inputEpoch,
+                count: message.inputs?.length ?? 0,
+            });
+            return;
+        }
+
         for (const { tick, input } of message.inputs) {
             this.engine.receiveRemoteInput(message.playerId, tick, input);
         }
@@ -599,11 +616,13 @@ export class Session {
             tick: message.tick,
             snapshotTick,
             hash: message.hash,
+            inputEpoch: message.inputEpoch ?? this.inputEpoch,
             localHashAtSnapshotTick,
             localState: localSnapshotState,
             remoteState: remoteSnapshotState,
         });
 
+        this.inputEpoch = message.inputEpoch ?? this.inputEpoch;
         this.engine.setState(message.tick, message.state, message.playerTimeline);
         this.pendingHashMessages = [];
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
@@ -646,12 +665,14 @@ export class Session {
     handleSyncRequest(message) {
         if (!this._isHost) return;
 
+        this.advanceInputEpoch();
+
         const state = this.engine.getState();
         for (const pt of state.playerTimeline) {
             const p = this.playerManager.get(pt.playerId);
             if (p) pt.name = p.name;
         }
-        const syncMsg = createSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline);
+        const syncMsg = createSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline, this.inputEpoch);
         this.broadcast(syncMsg, true);
         this.engine.resetForSync(state.tick, state.playerTimeline);
         this.pendingHashMessages = [];
@@ -708,7 +729,7 @@ export class Session {
                 const p = this.playerManager.get(pt.playerId);
                 if (p) pt.name = p.name;
             }
-            this.transport.send(peerId, encodeMessage(createStateSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline)), true);
+            this.transport.send(peerId, encodeMessage(createStateSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline, this.inputEpoch)), true);
         }
 
         if (this._state === SessionState.Playing && playerInfo.joinTick !== null) {
@@ -908,7 +929,11 @@ export class Session {
             }
         }
 
-        this.broadcast(createInput(this.localPlayerId, inputs), false);
+        this.broadcast(createInput(this.localPlayerId, inputs, this.inputEpoch), false);
+    }
+
+    advanceInputEpoch() {
+        this.inputEpoch = (this.inputEpoch + 1) & 0xFFFF;
     }
 
     sendPing(peerId) {

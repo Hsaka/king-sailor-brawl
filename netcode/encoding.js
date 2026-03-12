@@ -146,7 +146,7 @@ function encodeInputMessage(msg) {
     }
 
     const playerIdBytes = textEncoder.encode(msg.playerId);
-    let totalSize = 1 + 2 + playerIdBytes.length + 1;
+    let totalSize = 1 + 2 + playerIdBytes.length + 1 + 2;
     for (const entry of msg.inputs) {
         totalSize += 4 + 2 + entry.input.length;
     }
@@ -162,6 +162,8 @@ function encodeInputMessage(msg) {
     view.setUint8(offset++, MessageType.Input);
     offset += writeString(view, offset, msg.playerId);
     view.setUint8(offset++, msg.inputs.length);
+    view.setUint16(offset, msg.inputEpoch ?? 0);
+    offset += 2;
 
     for (const entry of msg.inputs) {
         view.setInt32(offset, entry.tick);
@@ -187,6 +189,9 @@ function decodeInputMessage(view, limits) {
 
     ensureBytes(view, offset, 1, msgType);
     const inputCount = view.getUint8(offset++);
+    ensureBytes(view, offset, 2, msgType);
+    const inputEpoch = view.getUint16(offset);
+    offset += 2;
     const inputs = [];
 
     for (let i = 0; i < inputCount; i++) {
@@ -208,7 +213,7 @@ function decodeInputMessage(view, limits) {
         inputs.push({ tick, input });
     }
 
-    return { type: MessageType.Input, playerId, inputs };
+    return { type: MessageType.Input, playerId, inputs, inputEpoch };
 }
 
 function encodeInputAckMessage(msg) {
@@ -272,7 +277,7 @@ function encodeSyncMessage(msg) {
         timelineSize += 2 + idBytes.length + 2 + nameBytes.length + 4 + 1 + (entry.leaveTick !== null ? 4 : 0);
     }
 
-    const buffer = new Uint8Array(1 + 4 + 4 + 4 + msg.state.length + timelineSize);
+    const buffer = new Uint8Array(1 + 4 + 4 + 2 + 4 + msg.state.length + timelineSize);
     const view = new DataView(buffer.buffer);
 
     let offset = 0;
@@ -281,6 +286,8 @@ function encodeSyncMessage(msg) {
     offset += 4;
     view.setUint32(offset, msg.hash);
     offset += 4;
+    view.setUint16(offset, msg.inputEpoch ?? 0);
+    offset += 2;
     offset += writeBytes(view, offset, msg.state);
 
     view.setUint16(offset, msg.playerTimeline.length);
@@ -311,6 +318,9 @@ function decodeSyncMessage(view, limits) {
     ensureBytes(view, offset, 4, msgType);
     const hash = view.getUint32(offset);
     offset += 4;
+    ensureBytes(view, offset, 2, msgType);
+    const inputEpoch = view.getUint16(offset);
+    offset += 2;
     const [state, stateLen] = readBytes(view, offset, msgType, limits.maxStateSize);
     offset += stateLen;
 
@@ -340,7 +350,7 @@ function decodeSyncMessage(view, limits) {
         playerTimeline.push({ playerId, name, joinTick, leaveTick });
     }
 
-    return { type: MessageType.Sync, tick, state, hash, playerTimeline };
+    return { type: MessageType.Sync, tick, state, hash, inputEpoch, playerTimeline };
 }
 
 function encodeSyncRequestMessage(msg) {
@@ -572,7 +582,7 @@ function encodeStateSyncMessage(msg) {
         timelineSize += 2 + idBytes.length + 2 + nameBytes.length + 4 + 1 + (entry.leaveTick !== null ? 4 : 0);
     }
 
-    const buffer = new Uint8Array(1 + 4 + 4 + 4 + msg.state.length + timelineSize);
+    const buffer = new Uint8Array(1 + 4 + 4 + 2 + 4 + msg.state.length + timelineSize);
     const view = new DataView(buffer.buffer);
 
     let offset = 0;
@@ -581,6 +591,8 @@ function encodeStateSyncMessage(msg) {
     offset += 4;
     view.setUint32(offset, msg.hash);
     offset += 4;
+    view.setUint16(offset, msg.inputEpoch ?? 0);
+    offset += 2;
     offset += writeBytes(view, offset, msg.state);
 
     view.setUint16(offset, msg.playerTimeline.length);
@@ -611,6 +623,9 @@ function decodeStateSyncMessage(view, limits) {
     ensureBytes(view, offset, 4, msgType);
     const hash = view.getUint32(offset);
     offset += 4;
+    ensureBytes(view, offset, 2, msgType);
+    const inputEpoch = view.getUint16(offset);
+    offset += 2;
     const [state, stateLen] = readBytes(view, offset, msgType, limits.maxStateSize);
     offset += stateLen;
 
@@ -640,7 +655,7 @@ function decodeStateSyncMessage(view, limits) {
         playerTimeline.push({ playerId, name, joinTick, leaveTick });
     }
 
-    return { type: MessageType.StateSync, tick, state, hash, playerTimeline };
+    return { type: MessageType.StateSync, tick, state, hash, inputEpoch, playerTimeline };
 }
 
 function encodePlayerJoinedMessage(msg) {

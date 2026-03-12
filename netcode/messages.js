@@ -32,8 +32,8 @@ export function isReliableMessage(msg) {
     }
 }
 
-export function createInput(playerId, inputs) {
-    return { type: MessageType.Input, playerId, inputs };
+export function createInput(playerId, inputs, inputEpoch = 0) {
+    return { type: MessageType.Input, playerId, inputs, inputEpoch };
 }
 
 export function createInputAck(playerId, ackedTick) {
@@ -44,8 +44,8 @@ export function createHash(playerId, tick, hash) {
     return { type: MessageType.Hash, playerId, tick, hash };
 }
 
-export function createSync(tick, state, hash, playerTimeline) {
-    return { type: MessageType.Sync, tick, state, hash, playerTimeline };
+export function createSync(tick, state, hash, playerTimeline, inputEpoch = 0) {
+    return { type: MessageType.Sync, tick, state, hash, playerTimeline, inputEpoch };
 }
 
 export function createSyncRequest(playerId, desyncTick, localHash) {
@@ -72,8 +72,8 @@ export function createJoinReject(playerId, reason) {
     return { type: MessageType.JoinReject, playerId, reason };
 }
 
-export function createStateSync(tick, state, hash, playerTimeline) {
-    return { type: MessageType.StateSync, tick, state, hash, playerTimeline };
+export function createStateSync(tick, state, hash, playerTimeline, inputEpoch = 0) {
+    return { type: MessageType.StateSync, tick, state, hash, playerTimeline, inputEpoch };
 }
 
 export function createPlayerJoined(playerId, role, joinTick, name) {

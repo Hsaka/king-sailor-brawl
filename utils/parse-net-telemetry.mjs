@@ -101,6 +101,7 @@ function main() {
     const catchUpEvents = events.filter((e) => e.type === 'catchup_clamped');
     const renderSnapEvents = events.filter((e) => e.type === 'render_snap');
     const syncStateDiffEvents = events.filter((e) => e.type === 'sync_state_diff');
+    const staleInputDroppedEvents = events.filter((e) => e.type === 'stale_input_dropped');
 
     const maxWorstBehind = activeFrames.reduce((m, e) => Math.max(m, safeNumber(e.worstTicksBehind)), 0);
     const maxRttMs = activeFrames.reduce((m, e) => Math.max(m, safeNumber(e.maxRttMs)), 0);
@@ -132,6 +133,7 @@ function main() {
     console.log(`  syncRequests: ${syncRequests.length}, synced: ${syncedEvents.length}, desync: ${desyncEvents.length}`);
     console.log(`  catchUpClamped events: ${catchUpEvents.length}, renderSnap events: ${renderSnapEvents.length}`);
     console.log(`  syncStateDiff events: ${syncStateDiffEvents.length}`);
+    console.log(`  staleInputDropped events: ${staleInputDroppedEvents.length}`);
     console.log('');
     console.log('Maxima');
     console.log(`  maxWorstBehindTicks: ${maxWorstBehind}`);
@@ -180,6 +182,7 @@ function main() {
                 .join(' | ');
             console.log(
                 `    tick=${d.tick} snapshot=${d.snapshotTick}` +
+                ` epoch=${d.inputEpoch ?? 'n/a'}` +
                 ` changedPlayers=${safeNumber(d.changedPlayerCount)}` +
                 ` localHash=${d.localHashAtSnapshotTick ?? 'n/a'}` +
                 ` syncHash=${d.syncHash ?? 'n/a'}`

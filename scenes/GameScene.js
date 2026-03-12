@@ -46,6 +46,7 @@ export class GameScene {
         this._sessionInputDelayHandler = null;
         this._sessionDesyncHandler = null;
         this._sessionLagReportHandler = null;
+        this._sessionStaleInputHandler = null;
         this._sessionSyncPayloadHandler = null;
         this._sessionStateChangeHandler = null;
         this._sessionErrorHandler = null;
@@ -100,6 +101,7 @@ export class GameScene {
             syncRequests: 0,
             desyncEvents: 0,
             lagReports: 0,
+            staleInputsDropped: 0,
             lastSyncTick: -1,
             lastDesyncTick: -1,
             lastLaggyPlayerId: '',
@@ -621,6 +623,19 @@ export class GameScene {
             };
             this.session.on('lagReport', this._sessionLagReportHandler);
         }
+        if (!this._sessionStaleInputHandler) {
+            this._sessionStaleInputHandler = (meta) => {
+                this.netDebug.staleInputsDropped++;
+                this.recordTelemetry('stale_input_dropped', {
+                    playerId: meta?.playerId ?? null,
+                    inputEpoch: meta?.inputEpoch ?? null,
+                    expectedEpoch: meta?.expectedEpoch ?? null,
+                    count: meta?.count ?? 0,
+                    currentTick: this.session ? this.session.currentTick : -1,
+                });
+            };
+            this.session.on('staleInputDropped', this._sessionStaleInputHandler);
+        }
         if (!this._sessionSyncPayloadHandler) {
             this._sessionSyncPayloadHandler = (payload) => {
                 const diff = this.buildSyncStateDiff(payload?.localState, payload?.remoteState);
@@ -628,6 +643,7 @@ export class GameScene {
                     tick: payload?.tick ?? -1,
                     snapshotTick: payload?.snapshotTick ?? -1,
                     syncHash: payload?.hash ?? null,
+                    inputEpoch: payload?.inputEpoch ?? null,
                     localHashAtSnapshotTick: payload?.localHashAtSnapshotTick ?? null,
                     ...diff,
                 });
@@ -1347,6 +1363,7 @@ export class GameScene {
             `maxRTT ${Math.round(dbg.maxRttMs)}ms  maxJitter ${Math.round(dbg.maxJitterMs)}ms`,
             `sync ${dbg.syncEvents} (req ${dbg.syncRequests}) lastSync ${dbg.lastSyncTick}`,
             `desync ${dbg.desyncEvents} last ${dbg.lastDesyncTick} lagReports ${dbg.lagReports}`,
+            `staleInputs ${dbg.staleInputsDropped}`,
         ];
         if (dbg.lastLaggyPlayerId) {
             lines.push(`lastLag ${dbg.lastLaggyPlayerId.slice(0, 8)} ${dbg.lastLagTicksBehind}t`);
@@ -1405,6 +1422,10 @@ export class GameScene {
         if (this._sessionLagReportHandler && this.session) {
             this.session.off('lagReport', this._sessionLagReportHandler);
             this._sessionLagReportHandler = null;
+        }
+        if (this._sessionStaleInputHandler && this.session) {
+            this.session.off('staleInputDropped', this._sessionStaleInputHandler);
+            this._sessionStaleInputHandler = null;
         }
         if (this._sessionSyncPayloadHandler && this.session) {
             this.session.off('syncPayload', this._sessionSyncPayloadHandler);
