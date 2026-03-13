@@ -318,6 +318,30 @@ export class Ship {
         const py = gameAreaY + this.y * s * mapScale;
         const r = this.def.hitboxRadius * s * mapScale;
 
+        const activeRings = [];
+        if (this.speedBoostTicks > 0) {
+            activeRings.push('rgba(30, 144, 255, 0.85)');
+        }
+        if (this.shieldTicks > 0) {
+            activeRings.push('rgba(46, 213, 115, 0.9)');
+        }
+        if (this.attackBoostTicks > 0) {
+            activeRings.push('rgba(255, 107, 107, 0.85)');
+        }
+
+        if (activeRings.length > 0) {
+            c.save();
+            for (let i = 0; i < activeRings.length; i++) {
+                const ringRadius = r + ((8 + (i * 6)) * s);
+                c.beginPath();
+                c.arc(px, py, ringRadius, 0, Math.PI * 2);
+                c.strokeStyle = activeRings[i];
+                c.lineWidth = Math.max(2, 2.5 * s);
+                c.stroke();
+            }
+            c.restore();
+        }
+
         c.save();
         if (this.invincibilityTimer > 0) {
             if (Math.floor(this.invincibilityTimer * 10) % 2 === 0) {
