@@ -52,8 +52,19 @@ function setPlayerState(world, playerId, overrides) {
     });
 }
 
-function createCombatWorld() {
-    const world = new WorldState();
+function createDangerBorderConfig(overrides = {}) {
+    return {
+        ENABLED: true,
+        START_DELAY_SECONDS: 0,
+        SHRINK_UNITS_PER_SECOND: 60,
+        MIN_INSET: 260,
+        DAMAGE_PER_SECOND: 15,
+        ...overrides,
+    };
+}
+
+function createCombatWorld(options = {}) {
+    const world = new WorldState(options);
     world.seed = 424242;
     world.setLocalPlayerId('p1');
     world.addPlayer('p1', 0);
@@ -79,8 +90,8 @@ function createCombatWorld() {
     return world;
 }
 
-function createRollbackWorld() {
-    const world = new WorldState();
+function createRollbackWorld(options = {}) {
+    const world = new WorldState(options);
     world.seed = 98765;
     world.setLocalPlayerId('p1');
     world.addPlayer('p1', 0);
@@ -293,6 +304,11 @@ test('world state hash covers the full serialized state and round-trips cleanly'
     const debrisHash = debrisChanged.hash(debrisChanged.serialize());
     assert.notEqual(debrisHash, baselineHash, 'debris changes must affect hash');
 
+    const borderChanged = createCombatWorld();
+    borderChanged.dangerBorder.elapsedTicks = 75;
+    borderChanged.dangerBorder.currentInset = 195;
+    assert.notEqual(borderChanged.hash(borderChanged.serialize()), baselineHash, 'danger border changes must affect hash');
+
     const roundTrip = new WorldState();
     roundTrip.deserialize(baselineBytes);
     const roundTripBytes = roundTrip.serialize();
@@ -301,8 +317,17 @@ test('world state hash covers the full serialized state and round-trips cleanly'
 });
 
 test('two peers remain byte-identical under the same scripted simulation', () => {
-    const worldA = createCombatWorld();
-    const worldB = createCombatWorld();
+    const borderConfig = createDangerBorderConfig({
+        MIN_INSET: 320,
+        DAMAGE_PER_SECOND: 22,
+    });
+    const worldA = createCombatWorld({ dangerBorderConfig: borderConfig });
+    const worldB = createCombatWorld({ dangerBorderConfig: borderConfig });
+
+    setPlayerState(worldA, 'p1', { x: 250, y: 250, heading: 0, speedTier: 1 });
+    setPlayerState(worldA, 'p2', { x: 2150, y: 2150, heading: 180, speedTier: 1 });
+    setPlayerState(worldB, 'p1', { x: 250, y: 250, heading: 0, speedTier: 1 });
+    setPlayerState(worldB, 'p2', { x: 2150, y: 2150, heading: 180, speedTier: 1 });
 
     worldA.spawnDebris(640, 640, ShipDefinitions.get('cobro').debris);
     worldB.spawnDebris(640, 640, ShipDefinitions.get('cobro').debris);
@@ -326,8 +351,12 @@ test('two peers remain byte-identical under the same scripted simulation', () =>
 });
 
 test('rollback engine converges back to the authoritative state after delayed remote inputs', () => {
-    const authoritative = createEngine(createRollbackWorld());
-    const predicted = createEngine(createRollbackWorld());
+    const borderConfig = createDangerBorderConfig({
+        MIN_INSET: 360,
+        DAMAGE_PER_SECOND: 20,
+    });
+    const authoritative = createEngine(createRollbackWorld({ dangerBorderConfig: borderConfig }));
+    const predicted = createEngine(createRollbackWorld({ dangerBorderConfig: borderConfig }));
     const remoteInputs = [];
     const delayTicks = 4;
     const totalTicks = 64;
@@ -375,4 +404,35 @@ test('rollback engine converges back to the authoritative state after delayed re
     const predictedState = predicted.getState().state;
     assertStateBytesEqual(predictedState, authoritativeState, 'predicted engine should converge to the authoritative state');
     assert.equal(predicted.getCurrentHash(), authoritative.getCurrentHash(), 'authoritative and predicted hashes should match after convergence');
+});
+
+test('danger border uses config-authored delay, shrink rate, and minimum inset deterministically', () => {
+    const world = createCombatWorld({
+        dangerBorderConfig: createDangerBorderConfig({
+            START_DELAY_SECONDS: 1,
+            SHRINK_UNITS_PER_SECOND: 60,
+            MIN_INSET: 125,
+        }),
+    });
+
+    assert.equal(world.dangerBorder.startDelayTicks, 60, 'seconds should convert to deterministic delay ticks once');
+    assert.equal(world.dangerBorder.shrinkUnitsPerTick, 1, 'units per second should convert to units per tick once');
+    assert.equal(world.dangerBorder.currentInset, 120, 'border should start at the arena death-zone inset');
+
+    for (let tick = 0; tick < 60; tick++) {
+        world.step(new Map());
+    }
+
+    assert.equal(world.dangerBorder.currentInset, 120, 'border should not shrink before the configured delay elapses');
+    assert.equal(world.dangerBorder.elapsedTicks, 60);
+
+    world.step(new Map());
+    assert.equal(world.dangerBorder.currentInset, 121, 'border should advance exactly one unit on the first shrink tick');
+
+    for (let i = 0; i < 8; i++) {
+        world.step(new Map());
+    }
+
+    assert.equal(world.dangerBorder.currentInset, 125, 'border should stop at the configured minimum inset');
+    assert.equal(world.dangerBorder.phase, 3, 'border should enter a locked phase once it reaches the stop threshold');
 });

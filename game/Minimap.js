@@ -7,7 +7,13 @@ export class Minimap {
      * Renders the minimap on the HUD layer (screen space coordinates)
      */
     render(c, s, worldState, localPlayerId, x, y, size) {
-        const map = CONFIG.MAPS[0]; // Active map
+        const map = worldState?.getArenaBounds?.() || worldState?.arena || CONFIG.MAPS[0];
+        const safeBounds = worldState?.getDangerBorderSafeBounds?.() || {
+            left: map.deathZoneDepth,
+            top: map.deathZoneDepth,
+            right: map.width - map.deathZoneDepth,
+            bottom: map.height - map.deathZoneDepth,
+        };
 
         c.save();
         c.translate(x, y);
@@ -21,16 +27,21 @@ export class Minimap {
         const mapH = map.height;
         const scaleX = size / mapW;
         const scaleY = size / mapH;
-
-        const dzScaleX = map.deathZoneDepth * scaleX;
-        const dzScaleY = map.deathZoneDepth * scaleY;
+        const safeLeft = safeBounds.left * scaleX;
+        const safeTop = safeBounds.top * scaleY;
+        const safeRight = safeBounds.right * scaleX;
+        const safeBottom = safeBounds.bottom * scaleY;
 
         // Draw death zone red vignette on minimap
         c.fillStyle = 'rgba(231, 110, 110, 0.81)';
-        c.fillRect(0, 0, size, dzScaleY); // Top
-        c.fillRect(0, size - dzScaleY, size, dzScaleY); // Bottom
-        c.fillRect(0, dzScaleY, dzScaleX, size - (dzScaleY * 2)); // Left
-        c.fillRect(size - dzScaleX, dzScaleY, dzScaleX, size - (dzScaleY * 2)); // Right
+        c.fillRect(0, 0, size, safeTop);
+        c.fillRect(0, safeBottom, size, size - safeBottom);
+        c.fillRect(0, safeTop, safeLeft, Math.max(0, safeBottom - safeTop));
+        c.fillRect(safeRight, safeTop, size - safeRight, Math.max(0, safeBottom - safeTop));
+
+        c.strokeStyle = '#FFA502';
+        c.lineWidth = Math.max(1, 1.5 * s);
+        c.strokeRect(safeLeft, safeTop, Math.max(0, safeRight - safeLeft), Math.max(0, safeBottom - safeTop));
 
         // Border
         c.strokeStyle = '#000000ff';

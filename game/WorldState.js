@@ -4,6 +4,12 @@ import { CONFIG } from '../config.js';
 
 const FNV_OFFSET_BASIS_32 = 0x811c9dc5;
 const FNV_PRIME_32 = 0x01000193;
+const DANGER_BORDER_PHASE = {
+    DISABLED: 0,
+    WAITING: 1,
+    SHRINKING: 2,
+    LOCKED: 3,
+};
 
 function hashBytesFNV1a(bytes) {
     let hash = FNV_OFFSET_BASIS_32;
@@ -15,7 +21,7 @@ function hashBytesFNV1a(bytes) {
 }
 
 export class WorldState {
-    constructor() {
+    constructor(options = {}) {
         this.players = new Map();
         this.localPlayerId = null;
 
@@ -28,6 +34,8 @@ export class WorldState {
         this.seed = 1337;
         this.debris = [];
         this.BOMB_TYPES = CONFIG.COMBAT.BOMB_TYPES;
+        this.arena = this.createArenaState(options.arenaConfig);
+        this.dangerBorder = this.createDangerBorderState(options.dangerBorderConfig, this.arena);
     }
 
     rand() {
@@ -38,6 +46,17 @@ export class WorldState {
     }
 
     quantizeState() {
+        this.arena.width = Math.fround(this.arena.width || 0);
+        this.arena.height = Math.fround(this.arena.height || 0);
+        this.arena.deathZoneDepth = Math.fround(this.arena.deathZoneDepth || 0);
+        this.arena.deathZoneDamage = Math.fround(this.arena.deathZoneDamage || 0);
+
+        this.dangerBorder.initialInset = Math.fround(this.dangerBorder.initialInset || 0);
+        this.dangerBorder.currentInset = Math.fround(this.dangerBorder.currentInset || 0);
+        this.dangerBorder.minInset = Math.fround(this.dangerBorder.minInset || 0);
+        this.dangerBorder.shrinkUnitsPerTick = Math.fround(this.dangerBorder.shrinkUnitsPerTick || 0);
+        this.dangerBorder.damagePerSecond = Math.fround(this.dangerBorder.damagePerSecond || 0);
+
         for (const [, player] of this.players) {
             player.x = Math.fround(player.x || 0);
             player.y = Math.fround(player.y || 0);
@@ -70,24 +89,160 @@ export class WorldState {
         return Array.from(this.players.entries()).sort(([a], [b]) => a.localeCompare(b));
     }
 
+    createArenaState(mapConfig = CONFIG.MAPS[0]) {
+        const map = mapConfig || {};
+        return {
+            width: Math.fround(Number(map.width) || 0),
+            height: Math.fround(Number(map.height) || 0),
+            deathZoneDepth: Math.fround(Number(map.deathZoneDepth) || 0),
+            deathZoneDamage: Math.fround(Number(map.deathZoneDamage) || 0),
+        };
+    }
+
+    createDangerBorderState(borderConfig = CONFIG.DANGER_BORDER, arena = this.arena) {
+        const config = borderConfig || {};
+        const tickRate = Math.max(1, Number(CONFIG.NETCODE?.TICK_RATE) || 60);
+        const enabled = !!config.ENABLED;
+        const initialInset = Math.max(0, Number(arena?.deathZoneDepth) || 0);
+        const maxInset = Math.max(
+            initialInset,
+            Math.min(Number(arena?.width) || 0, Number(arena?.height) || 0) * 0.5
+        );
+        const requestedMinInset = Number(config.MIN_INSET);
+        const minInset = Math.max(
+            initialInset,
+            Math.min(maxInset, Number.isFinite(requestedMinInset) ? requestedMinInset : initialInset)
+        );
+        const requestedDamage = Number(config.DAMAGE_PER_SECOND);
+        const damagePerSecond = Number.isFinite(requestedDamage)
+            ? Math.max(0, requestedDamage)
+            : Math.max(0, Number(arena?.deathZoneDamage) || 0);
+        const requestedShrinkRate = Number(config.SHRINK_UNITS_PER_SECOND);
+        const shrinkUnitsPerTick = Number.isFinite(requestedShrinkRate) && requestedShrinkRate > 0
+            ? requestedShrinkRate / tickRate
+            : 0;
+        const requestedDelaySeconds = Number(config.START_DELAY_SECONDS);
+        const startDelayTicks = Number.isFinite(requestedDelaySeconds) && requestedDelaySeconds > 0
+            ? Math.round(requestedDelaySeconds * tickRate)
+            : 0;
+
+        const border = {
+            enabled,
+            phase: enabled ? DANGER_BORDER_PHASE.WAITING : DANGER_BORDER_PHASE.DISABLED,
+            elapsedTicks: 0,
+            startDelayTicks,
+            initialInset,
+            currentInset: initialInset,
+            minInset,
+            shrinkUnitsPerTick,
+            damagePerSecond,
+        };
+        this.syncDangerBorderDerivedState(border);
+        return border;
+    }
+
+    setDangerBorderConfig(borderConfig) {
+        this.dangerBorder = this.createDangerBorderState(borderConfig, this.arena);
+        this.quantizeState();
+    }
+
+    syncDangerBorderDerivedState(border = this.dangerBorder) {
+        if (!border) return;
+
+        border.elapsedTicks = Math.max(0, border.elapsedTicks | 0);
+        border.startDelayTicks = Math.max(0, border.startDelayTicks | 0);
+        border.initialInset = Math.fround(Math.max(0, border.initialInset || 0));
+        border.minInset = Math.fround(Math.max(border.initialInset, border.minInset || 0));
+        border.shrinkUnitsPerTick = Math.fround(Math.max(0, border.shrinkUnitsPerTick || 0));
+        border.damagePerSecond = Math.fround(Math.max(0, border.damagePerSecond || 0));
+
+        if (!border.enabled) {
+            border.phase = DANGER_BORDER_PHASE.DISABLED;
+            border.currentInset = border.initialInset;
+            return;
+        }
+
+        if (border.minInset <= border.initialInset || border.shrinkUnitsPerTick <= 0) {
+            border.currentInset = border.initialInset;
+            border.phase = DANGER_BORDER_PHASE.LOCKED;
+            return;
+        }
+
+        const shrinkTicks = Math.max(0, border.elapsedTicks - border.startDelayTicks);
+        const unclampedInset = border.initialInset + (shrinkTicks * border.shrinkUnitsPerTick);
+        border.currentInset = Math.fround(Math.min(border.minInset, unclampedInset));
+
+        if (border.currentInset >= border.minInset) {
+            border.phase = DANGER_BORDER_PHASE.LOCKED;
+        } else if (border.elapsedTicks <= border.startDelayTicks) {
+            border.phase = DANGER_BORDER_PHASE.WAITING;
+        } else {
+            border.phase = DANGER_BORDER_PHASE.SHRINKING;
+        }
+    }
+
+    resetDangerBorderState() {
+        this.dangerBorder.elapsedTicks = 0;
+        this.syncDangerBorderDerivedState();
+    }
+
+    updateDangerBorderState() {
+        if (!this.dangerBorder.enabled) return;
+        this.dangerBorder.elapsedTicks += 1;
+        this.syncDangerBorderDerivedState();
+    }
+
+    getArenaBounds() {
+        return this.arena;
+    }
+
+    getDangerBorderInset() {
+        return this.dangerBorder.enabled ? this.dangerBorder.currentInset : this.arena.deathZoneDepth;
+    }
+
+    getDangerBorderDamagePerSecond() {
+        return this.dangerBorder.enabled ? this.dangerBorder.damagePerSecond : this.arena.deathZoneDamage;
+    }
+
+    getDangerBorderSafeBounds() {
+        const inset = this.getDangerBorderInset();
+        return {
+            left: inset,
+            top: inset,
+            right: this.arena.width - inset,
+            bottom: this.arena.height - inset,
+        };
+    }
+
+    isOutsideDangerBorder(x, y) {
+        const bounds = this.getDangerBorderSafeBounds();
+        return x < bounds.left || x > bounds.right || y < bounds.top || y > bounds.bottom;
+    }
+
+    getSpawnBounds() {
+        const spawnInset = Math.min(
+            Math.min(this.arena.width, this.arena.height) * 0.5,
+            this.dangerBorder.initialInset + 100
+        );
+        const xMin = spawnInset;
+        const xMax = Math.max(xMin, this.arena.width - spawnInset);
+        const yMin = spawnInset;
+        const yMax = Math.max(yMin, this.arena.height - spawnInset);
+        return { xMin, xMax, yMin, yMax };
+    }
+
     resetLevel() {
         this.seed = 1337;
         this.debris = [];
+        this.resetDangerBorderState();
 
         const playerIds = this.getSortedPlayerEntries().map(([id]) => id);
         for (const id of playerIds) {
             const p = this.players.get(id);
-
-            const map = CONFIG.MAPS[0];
-            const safeZoneDepth = map.deathZoneDepth + 100;
-            const xMin = safeZoneDepth;
-            const xMax = map.width - safeZoneDepth;
-            const yMin = safeZoneDepth;
-            const yMax = map.height - safeZoneDepth;
-
+            const { xMin, xMax, yMin, yMax } = this.getSpawnBounds();
             const x = xMin + this.rand() * (xMax - xMin);
             const y = yMin + this.rand() * (yMax - yMin);
-            let heading = (x < map.width / 2) ? 0 : 180;
+            const heading = (x < this.arena.width / 2) ? 0 : 180;
 
             p.x = x;
             p.y = y;
@@ -111,18 +266,10 @@ export class WorldState {
     }
 
     addPlayer(id, slotIndex) {
-        const map = CONFIG.MAPS[0];
-        const safeZoneDepth = map.deathZoneDepth + 100;
-
-        const xMin = safeZoneDepth;
-        const xMax = map.width - safeZoneDepth;
-        const yMin = safeZoneDepth;
-        const yMax = map.height - safeZoneDepth;
-
+        const { xMin, xMax, yMin, yMax } = this.getSpawnBounds();
         const x = xMin + this.rand() * (xMax - xMin);
         const y = yMin + this.rand() * (yMax - yMin);
-
-        let heading = (x < map.width / 2) ? 0 : 180;
+        const heading = (x < this.arena.width / 2) ? 0 : 180;
 
         this.players.set(id, {
             slot: slotIndex,
@@ -171,7 +318,7 @@ export class WorldState {
     serialize() {
         const playerEntries = this.getSortedPlayerEntries();
         const count = playerEntries.length;
-        let bufferSize = 4 + 4 + 4 + (this.debris.length * 33); // count(4) + seed(4) + debrisCount(4) + debris(33 ea - 8 floats + 1 byte for type)
+        let bufferSize = 64 + (this.debris.length * 33); // header(64) + debris(33 ea - 8 floats + 1 byte for type)
         const encoder = new TextEncoder();
         const idBytesList = [];
 
@@ -186,10 +333,23 @@ export class WorldState {
         const view = new DataView(buffer);
         const uint8View = new Uint8Array(buffer);
 
-        view.setUint32(0, count, true);
-        view.setUint32(4, this.seed, true);
-        view.setUint32(8, this.debris.length, true);
-        let offset = 12;
+        let offset = 0;
+        view.setUint32(offset, count, true); offset += 4;
+        view.setUint32(offset, this.seed, true); offset += 4;
+        view.setUint32(offset, this.debris.length, true); offset += 4;
+        view.setFloat32(offset, this.arena.width, true); offset += 4;
+        view.setFloat32(offset, this.arena.height, true); offset += 4;
+        view.setFloat32(offset, this.arena.deathZoneDepth, true); offset += 4;
+        view.setFloat32(offset, this.arena.deathZoneDamage, true); offset += 4;
+        view.setUint32(offset, this.dangerBorder.enabled ? 1 : 0, true); offset += 4;
+        view.setUint32(offset, this.dangerBorder.phase, true); offset += 4;
+        view.setUint32(offset, this.dangerBorder.elapsedTicks, true); offset += 4;
+        view.setUint32(offset, this.dangerBorder.startDelayTicks, true); offset += 4;
+        view.setFloat32(offset, this.dangerBorder.initialInset, true); offset += 4;
+        view.setFloat32(offset, this.dangerBorder.currentInset, true); offset += 4;
+        view.setFloat32(offset, this.dangerBorder.minInset, true); offset += 4;
+        view.setFloat32(offset, this.dangerBorder.shrinkUnitsPerTick, true); offset += 4;
+        view.setFloat32(offset, this.dangerBorder.damagePerSecond, true); offset += 4;
 
         for (let i = 0; i < playerEntries.length; i++) {
             const [id, p] = playerEntries[i];
@@ -243,10 +403,29 @@ export class WorldState {
     deserialize(data) {
         const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
         const uint8View = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-        const count = view.getUint32(0, true);
-        this.seed = view.getUint32(4, true);
-        const debrisCount = view.getUint32(8, true);
-        let offset = 12;
+        let offset = 0;
+        const count = view.getUint32(offset, true); offset += 4;
+        this.seed = view.getUint32(offset, true); offset += 4;
+        const debrisCount = view.getUint32(offset, true); offset += 4;
+        this.arena = {
+            width: view.getFloat32(offset, true),
+            height: view.getFloat32(offset + 4, true),
+            deathZoneDepth: view.getFloat32(offset + 8, true),
+            deathZoneDamage: view.getFloat32(offset + 12, true),
+        };
+        offset += 16;
+        this.dangerBorder = {
+            enabled: view.getUint32(offset, true) === 1,
+            phase: view.getUint32(offset + 4, true),
+            elapsedTicks: view.getUint32(offset + 8, true),
+            startDelayTicks: view.getUint32(offset + 12, true),
+            initialInset: view.getFloat32(offset + 16, true),
+            currentInset: view.getFloat32(offset + 20, true),
+            minInset: view.getFloat32(offset + 24, true),
+            shrinkUnitsPerTick: view.getFloat32(offset + 28, true),
+            damagePerSecond: view.getFloat32(offset + 32, true),
+        };
+        offset += 36;
 
         this.players.clear();
         this.lastInput.clear();
@@ -353,23 +532,22 @@ export class WorldState {
         }
 
         let targetAngle = pdata.heading;
-        const map = CONFIG.MAPS[0];
-        const safeMargin = map.deathZoneDepth + 150;
+        const safeMargin = this.getDangerBorderInset() + 150;
 
         let inDanger = false;
         let dangerDx = 0;
         let dangerDy = 0;
 
         if (pdata.x < safeMargin) { inDanger = true; dangerDx = 1; }
-        else if (pdata.x > map.width - safeMargin) { inDanger = true; dangerDx = -1; }
+        else if (pdata.x > this.arena.width - safeMargin) { inDanger = true; dangerDx = -1; }
 
         if (pdata.y < safeMargin) { inDanger = true; dangerDy = 1; }
-        else if (pdata.y > map.height - safeMargin) { inDanger = true; dangerDy = -1; }
+        else if (pdata.y > this.arena.height - safeMargin) { inDanger = true; dangerDy = -1; }
 
         if (inDanger) {
             targetAngle = Math.atan2(dangerDy, dangerDx) * 180 / Math.PI;
             if (dangerDx === 0 && dangerDy === 0) {
-                targetAngle = Math.atan2(map.height / 2 - pdata.y, map.width / 2 - pdata.x) * 180 / Math.PI;
+                targetAngle = Math.atan2(this.arena.height / 2 - pdata.y, this.arena.width / 2 - pdata.x) * 180 / Math.PI;
             }
         } else if (nearestEnemy) {
             let angleToEnemy = Math.atan2(nearestEnemy.dy, nearestEnemy.dx) * 180 / Math.PI;
@@ -430,6 +608,7 @@ export class WorldState {
     step(inputs) {
         const dt = 1 / CONFIG.NETCODE.TICK_RATE;
         const sortedPlayers = this.getSortedPlayerEntries();
+        this.updateDangerBorderState();
 
         for (const [id, pdata] of sortedPlayers) {
             let flags = 0;
@@ -660,15 +839,16 @@ export class WorldState {
         }
 
         // Process Death Zone
-        const map = CONFIG.MAPS[0];
+        const dangerBounds = this.getDangerBorderSafeBounds();
+        const dangerDamagePerSecond = this.getDangerBorderDamagePerSecond();
         for (const [id, pdata] of sortedPlayers) {
             if (!pdata.alive) continue;
 
-            if (pdata.x < map.deathZoneDepth || pdata.x > map.width - map.deathZoneDepth ||
-                pdata.y < map.deathZoneDepth || pdata.y > map.height - map.deathZoneDepth) {
+            if (pdata.x < dangerBounds.left || pdata.x > dangerBounds.right ||
+                pdata.y < dangerBounds.top || pdata.y > dangerBounds.bottom) {
 
                 if (!matchEnded) {
-                    pdata.health -= map.deathZoneDamage * dt;
+                    pdata.health -= dangerDamagePerSecond * dt;
                     if (pdata.health <= 0) {
                         pdata.health = 0;
                         pdata.alive = false;

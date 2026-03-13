@@ -342,6 +342,21 @@ export class GameScene {
         return d;
     }
 
+    getArenaConfig() {
+        return this.worldState?.getArenaBounds?.() || this.worldState?.arena || this.map;
+    }
+
+    getDangerBorderState() {
+        return this.worldState?.dangerBorder || null;
+    }
+
+    getDangerBorderPhaseLabel(phase) {
+        if (phase === 1) return 'waiting';
+        if (phase === 2) return 'shrinking';
+        if (phase === 3) return 'locked';
+        return 'disabled';
+    }
+
     decodeStateBytesToWorld(stateBytes) {
         if (!(stateBytes instanceof Uint8Array)) return null;
         try {
@@ -373,6 +388,36 @@ export class GameScene {
         const fieldCounts = {};
         const ids = new Set([...localWorld.players.keys(), ...remoteWorld.players.keys()]);
         const changedPlayers = [];
+        const localArena = localWorld.arena || {};
+        const remoteArena = remoteWorld.arena || {};
+        const localBorder = localWorld.dangerBorder || {};
+        const remoteBorder = remoteWorld.dangerBorder || {};
+
+        const arenaWidthDiff = Math.abs((remoteArena.width || 0) - (localArena.width || 0));
+        const arenaHeightDiff = Math.abs((remoteArena.height || 0) - (localArena.height || 0));
+        const arenaDepthDiff = Math.abs((remoteArena.deathZoneDepth || 0) - (localArena.deathZoneDepth || 0));
+        const arenaDamageDiff = Math.abs((remoteArena.deathZoneDamage || 0) - (localArena.deathZoneDamage || 0));
+        const borderInsetDiff = Math.abs((remoteBorder.currentInset || 0) - (localBorder.currentInset || 0));
+        const borderMinInsetDiff = Math.abs((remoteBorder.minInset || 0) - (localBorder.minInset || 0));
+        const borderDelayDiff = Math.abs((remoteBorder.startDelayTicks || 0) - (localBorder.startDelayTicks || 0));
+        const borderElapsedDiff = Math.abs((remoteBorder.elapsedTicks || 0) - (localBorder.elapsedTicks || 0));
+        const borderRateDiff = Math.abs((remoteBorder.shrinkUnitsPerTick || 0) - (localBorder.shrinkUnitsPerTick || 0));
+        const borderDamageDiff = Math.abs((remoteBorder.damagePerSecond || 0) - (localBorder.damagePerSecond || 0));
+        const borderPhaseChanged = (remoteBorder.phase || 0) !== (localBorder.phase || 0);
+        const borderEnabledChanged = !!remoteBorder.enabled !== !!localBorder.enabled;
+
+        if (arenaWidthDiff > 0.01) bump(fieldCounts, 'arena_width');
+        if (arenaHeightDiff > 0.01) bump(fieldCounts, 'arena_height');
+        if (arenaDepthDiff > 0.01) bump(fieldCounts, 'arena_deathZoneDepth');
+        if (arenaDamageDiff > 0.01) bump(fieldCounts, 'arena_deathZoneDamage');
+        if (borderInsetDiff > 0.01) bump(fieldCounts, 'dangerBorder_inset');
+        if (borderMinInsetDiff > 0.01) bump(fieldCounts, 'dangerBorder_minInset');
+        if (borderDelayDiff > 0) bump(fieldCounts, 'dangerBorder_startDelayTicks');
+        if (borderElapsedDiff > 0) bump(fieldCounts, 'dangerBorder_elapsedTicks');
+        if (borderRateDiff > 0.0001) bump(fieldCounts, 'dangerBorder_shrinkUnitsPerTick');
+        if (borderDamageDiff > 0.01) bump(fieldCounts, 'dangerBorder_damagePerSecond');
+        if (borderPhaseChanged) bump(fieldCounts, 'dangerBorder_phase');
+        if (borderEnabledChanged) bump(fieldCounts, 'dangerBorder_enabled');
 
         for (const id of [...ids].sort((a, b) => a.localeCompare(b))) {
             const local = localWorld.players.get(id);
@@ -499,6 +544,14 @@ export class GameScene {
                 typeDiffCount: debrisTypeDiffCount,
                 lifeDiffCount: debrisLifeDiffCount,
                 maxPosDiff: Number(maxDebrisPosDiff.toFixed(3)),
+            },
+            dangerBorder: {
+                localPhase: this.getDangerBorderPhaseLabel(localBorder.phase || 0),
+                remotePhase: this.getDangerBorderPhaseLabel(remoteBorder.phase || 0),
+                localInset: Number(((localBorder.currentInset || 0)).toFixed(3)),
+                remoteInset: Number(((remoteBorder.currentInset || 0)).toFixed(3)),
+                insetDiff: Number(borderInsetDiff.toFixed(3)),
+                elapsedTickDiff: borderElapsedDiff,
             },
         };
     }
@@ -1194,6 +1247,7 @@ export class GameScene {
 
         const focusPlayer = this.worldState.players.get(focusId);
         const focusSmooth = this.renderShipState.get(focusId);
+        const arena = this.getArenaConfig();
         this.focusId = focusId;
         if (focusPlayer) {
             const targetCamX = focusSmooth ? focusSmooth.x : focusPlayer.x;
@@ -1202,15 +1256,15 @@ export class GameScene {
             this.camY += (targetCamY - this.camY) * 0.1;
 
             // Camera bounds
-            const padding = this.map.deathZoneDepth;
+            const padding = arena.deathZoneDepth;
             const s = game.scale;
             const sw = mainCanvasSize.x;
             const sh = mainCanvasSize.y;
 
             // Limit view to stay roughly within death zone + small margin
-            const maxCamX = this.map.width + padding - (sw / 2) / s;
+            const maxCamX = arena.width + padding - (sw / 2) / s;
             const minCamX = -padding + (sw / 2) / s;
-            const maxCamY = this.map.height + padding - (sh / 2) / s;
+            const maxCamY = arena.height + padding - (sh / 2) / s;
             const minCamY = -padding + (sh / 2) / s;
 
             // Only clamp if the map is actually larger than the screen
@@ -1272,6 +1326,14 @@ export class GameScene {
         c.fillRect(0, 0, sw, sh);
 
         if (!this.session) return;
+        const arena = this.getArenaConfig();
+        const dangerBounds = this.worldState?.getDangerBorderSafeBounds?.() || {
+            left: arena.deathZoneDepth,
+            top: arena.deathZoneDepth,
+            right: arena.width - arena.deathZoneDepth,
+            bottom: arena.height - arena.deathZoneDepth,
+        };
+        const borderEnabled = !!this.getDangerBorderState()?.enabled;
 
         // Viewport center relative to map
         // Game screen is the full viewport physical dims
@@ -1304,8 +1366,8 @@ export class GameScene {
         // Draw map boundaries
         const mx = renderOffsetX;
         const my = renderOffsetY;
-        const mw = this.map.width * s;
-        const mh = this.map.height * s;
+        const mw = arena.width * s;
+        const mh = arena.height * s;
         c.lineWidth = 4 * s;
         c.strokeStyle = '#FFFFFF';
         c.strokeRect(mx, my, mw, mh);
@@ -1313,10 +1375,20 @@ export class GameScene {
         // Draw death zone overlay vignette
         // Simplest: fill rects outside the bounds with red tint
         c.fillStyle = `rgba(255,0,0,${CONFIG.DEATH_ZONE.VIGNETTE_ALPHA * 0.3})`;
-        c.fillRect(0, 0, sw, Math.max(0, my + this.map.deathZoneDepth * s));
-        c.fillRect(0, Math.min(sh, my + mh - this.map.deathZoneDepth * s), sw, sh);
-        c.fillRect(0, 0, Math.max(0, mx + this.map.deathZoneDepth * s), sh);
-        c.fillRect(Math.min(sw, mx + mw - this.map.deathZoneDepth * s), 0, sw, sh);
+        c.fillRect(0, 0, sw, Math.max(0, my + dangerBounds.top * s));
+        c.fillRect(0, Math.min(sh, my + dangerBounds.bottom * s), sw, sh);
+        c.fillRect(0, 0, Math.max(0, mx + dangerBounds.left * s), sh);
+        c.fillRect(Math.min(sw, mx + dangerBounds.right * s), 0, sw, sh);
+
+        const safeRectX = renderOffsetX + dangerBounds.left * s;
+        const safeRectY = renderOffsetY + dangerBounds.top * s;
+        const safeRectW = Math.max(0, (dangerBounds.right - dangerBounds.left) * s);
+        const safeRectH = Math.max(0, (dangerBounds.bottom - dangerBounds.top) * s);
+        if (safeRectW > 0 && safeRectH > 0) {
+            c.lineWidth = Math.max(2, 3 * s);
+            c.strokeStyle = borderEnabled ? '#FFA502' : '#FF6B6B';
+            c.strokeRect(safeRectX, safeRectY, safeRectW, safeRectH);
+        }
 
         // Render Ships
         for (const [id, pdata] of this.worldState.players) {
@@ -1479,6 +1551,7 @@ export class GameScene {
     drawNetDebugOverlay(sw, s) {
         const dbg = this.netDebug;
         const localAhead = Math.max(0, this.session.currentTick - (this.session.confirmedTick + 1));
+        const dangerBorder = this.getDangerBorderState();
         const lines = [
             'NET DEBUG (F3)',
             `tick cur/conf ${this.session.currentTick}/${this.session.confirmedTick}  ahead ${localAhead}`,
@@ -1496,6 +1569,11 @@ export class GameScene {
             `hash ok/mm/pr ${dbg.hashMatches}/${dbg.hashMismatches}/${dbg.hashPruned} last ${dbg.lastHashPhase || '-'}@${dbg.lastHashTick}`,
             `transport err/disc ${dbg.transportErrors}/${dbg.transportDisconnects} ${dbg.lastTransportPhase || '-'} ${dbg.lastTransportReason || '-'}`,
         ];
+        if (dangerBorder) {
+            lines.push(
+                `border ${this.getDangerBorderPhaseLabel(dangerBorder.phase)} inset ${dangerBorder.currentInset.toFixed(1)} min ${dangerBorder.minInset.toFixed(1)} t ${dangerBorder.elapsedTicks}`
+            );
+        }
         if (dbg.lastLaggyPlayerId) {
             lines.push(`lastLag ${dbg.lastLaggyPlayerId.slice(0, 8)} ${dbg.lastLagTicksBehind}t`);
         }

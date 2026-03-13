@@ -120,6 +120,14 @@ export const CONFIG = {
         VIGNETTE_ALPHA: 0.6,
     },
 
+    DANGER_BORDER: {
+        ENABLED: true,
+        START_DELAY_SECONDS: 30,
+        SHRINK_UNITS_PER_SECOND: 12,
+        MIN_INSET: 720, // final safe-zone inset from each map edge
+        DAMAGE_PER_SECOND: 15,
+    },
+
     NETCODE: {
         TICK_RATE: 60,
         SNAPSHOT_HISTORY: 120,
