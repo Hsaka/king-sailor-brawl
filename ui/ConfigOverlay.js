@@ -91,7 +91,7 @@ export class ConfigOverlay {
         this.container.addEventListener('pointerup', stopProp);
         this.container.addEventListener('pointermove', stopProp);
 
-        this.loadConfigs();
+        // this.loadConfigs();
     }
 
     isPlainObject(value) {
@@ -387,7 +387,7 @@ export class ConfigOverlay {
         this.applyConfigToRuntime(persistable);
 
         // Save
-        this.saveConfigs();
+        // this.saveConfigs();
         this.hide();
     }
 
