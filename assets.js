@@ -72,6 +72,45 @@ export const ASSETS = {
         // path: 'images/bomb.png',
     },
 
+    powerupSpeedBoost: {
+        type: 'texture',
+        source: 'procedural',
+        path: 'images/powerups/speed_boost.png',
+        procedural: {
+            kind: 'emoji-badge',
+            emoji: '⚡',
+            fillStyle: '#1E90FF',
+            ringStyle: '#F5F6FA',
+            glowStyle: 'rgba(30, 144, 255, 0.45)',
+        },
+    },
+
+    powerupShield: {
+        type: 'texture',
+        source: 'procedural',
+        path: 'images/powerups/shield.png',
+        procedural: {
+            kind: 'emoji-badge',
+            emoji: '🛡️',
+            fillStyle: '#2ED573',
+            ringStyle: '#F5F6FA',
+            glowStyle: 'rgba(46, 213, 115, 0.45)',
+        },
+    },
+
+    powerupAttackBoost: {
+        type: 'texture',
+        source: 'procedural',
+        path: 'images/powerups/attack_boost.png',
+        procedural: {
+            kind: 'emoji-badge',
+            emoji: '⚔️',
+            fillStyle: '#FF6B6B',
+            ringStyle: '#F5F6FA',
+            glowStyle: 'rgba(255, 107, 107, 0.45)',
+        },
+    },
+
     // ── AUDIO ─────────────────────────────────────────────────────────────────
 
     // UI click — ZzFX procedural (works without any audio files)

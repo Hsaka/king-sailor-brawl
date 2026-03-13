@@ -1,7 +1,9 @@
 import { CONFIG } from '../config.js';
 import { mainCanvasSize, mainContext, vec2, mod } from '../littlejs.esm.min.js';
+import { getPowerupAssetKey } from '../game/PowerupDefinitions.js';
 import { ShipDefinitions } from '../game/ShipDefinitions.js';
 import { drawScreenText } from '../utils/DrawUtils.js';
+import { assetManager } from '../utils/AssetManager.js';
 
 export class HUD {
     constructor() {
@@ -51,6 +53,8 @@ export class HUD {
 
         // draw health text
         drawScreenText(`${Math.ceil(localPlayer.health)} / ${def.maxHealth}`, sw / 2, hpY + hpBarH / 2 + 2 * s, 14 * s * 1.5, '#000000ff', 'center', 'middle');
+
+        this.drawActivePowerups(c, s, worldState, localPlayer, hpX, hpY + hpBarH + (16 * s));
 
         // Speed indicator
         // const speedText = `SPEED: ${localPlayer.speedTier}`;
@@ -167,5 +171,59 @@ export class HUD {
         }
 
         c.restore();
+    }
+
+    getPowerupBadgeData(worldState, localPlayer) {
+        const powerupConfig = worldState.powerupConfig || {};
+        const typeConfigs = Array.isArray(powerupConfig.types) ? powerupConfig.types : [];
+        return [
+            {
+                typeKey: 'speed_boost',
+                ticks: localPlayer.speedBoostTicks || 0,
+                color: '#1E90FF',
+            },
+            {
+                typeKey: 'shield',
+                ticks: localPlayer.shieldTicks || 0,
+                color: '#2ED573',
+            },
+            {
+                typeKey: 'attack_boost',
+                ticks: localPlayer.attackBoostTicks || 0,
+                color: '#FF6B6B',
+            },
+        ].filter((entry, index) => entry.ticks > 0 && !!typeConfigs[index]?.enabled);
+    }
+
+    drawActivePowerups(c, s, worldState, localPlayer, x, y) {
+        const badges = this.getPowerupBadgeData(worldState, localPlayer);
+        if (badges.length === 0) return;
+
+        const pad = 12 * s;
+        const badgeW = 120 * s;
+        const badgeH = 38 * s;
+        const tickRate = Math.max(1, CONFIG.NETCODE.TICK_RATE || 60);
+
+        for (let i = 0; i < badges.length; i++) {
+            const badge = badges[i];
+            const bx = x + i * (badgeW + pad);
+            const by = y;
+            const remainingSeconds = badge.ticks / tickRate;
+            const asset = assetManager.getAsset(getPowerupAssetKey(badge.typeKey));
+            const emoji = asset?.procedural?.emoji || '?';
+
+            c.save();
+            c.fillStyle = 'rgba(12, 18, 30, 0.82)';
+            c.strokeStyle = badge.color;
+            c.lineWidth = 2 * s;
+            c.beginPath();
+            c.roundRect(bx, by, badgeW, badgeH, 12 * s);
+            c.fill();
+            c.stroke();
+
+            drawScreenText(emoji, bx + 18 * s, by + (badgeH / 2), 18 * s, '#FFFFFF', 'center', 'middle');
+            drawScreenText(`${remainingSeconds.toFixed(1)}s`, bx + 72 * s, by + (badgeH / 2), 14 * s, '#FFFFFF', 'center', 'middle');
+            c.restore();
+        }
     }
 }

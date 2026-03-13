@@ -128,6 +128,44 @@ export const CONFIG = {
         DAMAGE_PER_SECOND: 15,
     },
 
+    POWERUPS: {
+        ENABLED: true,
+        MAX_ACTIVE: 4,
+        SPAWN_ENABLED: true,
+        SPAWN_INTERVAL_SECONDS: 7,
+        SPAWN_BATCH_SIZE: 1,
+        DESPAWN_AFTER_SECONDS: 15,
+        PICKUP_RADIUS: 18,
+        SPAWN_EDGE_INSET_X: 220,
+        SPAWN_EDGE_INSET_Y: 220,
+        SPAWN_PLAYER_CLEARANCE: 180,
+        SPAWN_POWERUP_CLEARANCE: 120,
+        SPAWN_POSITION_ATTEMPTS: 8,
+        SAME_TYPE_PICKUP_BEHAVIOR: 'refresh',
+        TYPES: {
+            speed_boost: {
+                ENABLED: true,
+                DURATION_SECONDS: 4,
+                SPEED_MULTIPLIER: 1.35,
+                SPAWN_WEIGHT: 4,
+                MAX_ACTIVE: 2,
+            },
+            shield: {
+                ENABLED: true,
+                DURATION_SECONDS: 4,
+                SPAWN_WEIGHT: 3,
+                MAX_ACTIVE: 2,
+            },
+            attack_boost: {
+                ENABLED: true,
+                DURATION_SECONDS: 4,
+                DAMAGE_MULTIPLIER: 1.5,
+                SPAWN_WEIGHT: 3,
+                MAX_ACTIVE: 2,
+            },
+        },
+    },
+
     NETCODE: {
         TICK_RATE: 60,
         SNAPSHOT_HISTORY: 120,

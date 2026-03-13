@@ -3,6 +3,7 @@ import { CONFIG } from '../config.js';
 import { game, switchScene } from '../App.js';
 import { drawScreenText, draw3DButton, drawRoundRect } from '../utils/DrawUtils.js';
 import { Ship } from '../game/Ship.js';
+import { getPowerupAssetKey, POWERUP_TYPES } from '../game/PowerupDefinitions.js';
 import { WorldState } from '../game/WorldState.js';
 import { Minimap } from '../game/Minimap.js';
 import { assetManager } from '../utils/AssetManager.js';
@@ -30,6 +31,7 @@ export class GameScene {
         this.camX = 0;
         this.camY = 0;
         this._proceduralClouds = null;
+        this._proceduralTextureCache = new Map();
 
         this.minimap = new Minimap();
         this.hud = new HUD();
@@ -381,6 +383,7 @@ export class GameScene {
                 localAvailable: false,
                 remotePlayerCount: remoteWorld.players.size,
                 remoteDebrisCount: remoteWorld.debris.length,
+                remotePowerupCount: remoteWorld.powerups?.length || 0,
             };
         }
 
@@ -392,6 +395,8 @@ export class GameScene {
         const remoteArena = remoteWorld.arena || {};
         const localBorder = localWorld.dangerBorder || {};
         const remoteBorder = remoteWorld.dangerBorder || {};
+        const localPowerupConfig = localWorld.powerupConfig || {};
+        const remotePowerupConfig = remoteWorld.powerupConfig || {};
 
         const arenaWidthDiff = Math.abs((remoteArena.width || 0) - (localArena.width || 0));
         const arenaHeightDiff = Math.abs((remoteArena.height || 0) - (localArena.height || 0));
@@ -405,6 +410,15 @@ export class GameScene {
         const borderDamageDiff = Math.abs((remoteBorder.damagePerSecond || 0) - (localBorder.damagePerSecond || 0));
         const borderPhaseChanged = (remoteBorder.phase || 0) !== (localBorder.phase || 0);
         const borderEnabledChanged = !!remoteBorder.enabled !== !!localBorder.enabled;
+        const powerupEnabledChanged = !!remotePowerupConfig.enabled !== !!localPowerupConfig.enabled;
+        const powerupSpawnEnabledChanged = !!remotePowerupConfig.spawnEnabled !== !!localPowerupConfig.spawnEnabled;
+        const powerupMaxActiveDiff = Math.abs((remotePowerupConfig.maxActive || 0) - (localPowerupConfig.maxActive || 0));
+        const powerupSpawnIntervalDiff = Math.abs((remotePowerupConfig.spawnIntervalTicks || 0) - (localPowerupConfig.spawnIntervalTicks || 0));
+        const powerupSpawnBatchDiff = Math.abs((remotePowerupConfig.spawnBatchSize || 0) - (localPowerupConfig.spawnBatchSize || 0));
+        const powerupDespawnDiff = Math.abs((remotePowerupConfig.despawnAfterTicks || 0) - (localPowerupConfig.despawnAfterTicks || 0));
+        const powerupPickupRadiusDiff = Math.abs((remotePowerupConfig.pickupRadius || 0) - (localPowerupConfig.pickupRadius || 0));
+        const powerupSpawnTimerDiff = Math.abs((remoteWorld.powerupSpawnTicksUntilNext || 0) - (localWorld.powerupSpawnTicksUntilNext || 0));
+        const powerupNextIdDiff = Math.abs((remoteWorld.nextPowerupId || 0) - (localWorld.nextPowerupId || 0));
 
         if (arenaWidthDiff > 0.01) bump(fieldCounts, 'arena_width');
         if (arenaHeightDiff > 0.01) bump(fieldCounts, 'arena_height');
@@ -418,6 +432,30 @@ export class GameScene {
         if (borderDamageDiff > 0.01) bump(fieldCounts, 'dangerBorder_damagePerSecond');
         if (borderPhaseChanged) bump(fieldCounts, 'dangerBorder_phase');
         if (borderEnabledChanged) bump(fieldCounts, 'dangerBorder_enabled');
+        if (powerupEnabledChanged) bump(fieldCounts, 'powerups_enabled');
+        if (powerupSpawnEnabledChanged) bump(fieldCounts, 'powerups_spawnEnabled');
+        if (powerupMaxActiveDiff > 0) bump(fieldCounts, 'powerups_maxActive');
+        if (powerupSpawnIntervalDiff > 0) bump(fieldCounts, 'powerups_spawnIntervalTicks');
+        if (powerupSpawnBatchDiff > 0) bump(fieldCounts, 'powerups_spawnBatchSize');
+        if (powerupDespawnDiff > 0) bump(fieldCounts, 'powerups_despawnAfterTicks');
+        if (powerupPickupRadiusDiff > 0.01) bump(fieldCounts, 'powerups_pickupRadius');
+        if (powerupSpawnTimerDiff > 0) bump(fieldCounts, 'powerups_spawnTimer');
+        if (powerupNextIdDiff > 0) bump(fieldCounts, 'powerups_nextId');
+
+        const localTypeConfigs = Array.isArray(localPowerupConfig.types) ? localPowerupConfig.types : [];
+        const remoteTypeConfigs = Array.isArray(remotePowerupConfig.types) ? remotePowerupConfig.types : [];
+        for (let i = 0; i < POWERUP_TYPES.length; i++) {
+            const typeKey = POWERUP_TYPES[i];
+            const localType = localTypeConfigs[i] || {};
+            const remoteType = remoteTypeConfigs[i] || {};
+
+            if (!!remoteType.enabled !== !!localType.enabled) bump(fieldCounts, `powerup_type_enabled_${typeKey}`);
+            if (Math.abs((remoteType.durationTicks || 0) - (localType.durationTicks || 0)) > 0) bump(fieldCounts, `powerup_type_duration_${typeKey}`);
+            if (Math.abs((remoteType.speedMultiplier || 0) - (localType.speedMultiplier || 0)) > 0.0001) bump(fieldCounts, `powerup_type_speed_${typeKey}`);
+            if (Math.abs((remoteType.damageMultiplier || 0) - (localType.damageMultiplier || 0)) > 0.0001) bump(fieldCounts, `powerup_type_damage_${typeKey}`);
+            if (Math.abs((remoteType.spawnWeight || 0) - (localType.spawnWeight || 0)) > 0) bump(fieldCounts, `powerup_type_weight_${typeKey}`);
+            if (Math.abs((remoteType.maxActive || 0) - (localType.maxActive || 0)) > 0) bump(fieldCounts, `powerup_type_maxActive_${typeKey}`);
+        }
 
         for (const id of [...ids].sort((a, b) => a.localeCompare(b))) {
             const local = localWorld.players.get(id);
@@ -446,6 +484,9 @@ export class GameScene {
             const invincibilityDiff = Math.abs((remote.invincibilityTimer || 0) - (local.invincibilityTimer || 0));
             const speedTierChanged = (remote.speedTier || 0) !== (local.speedTier || 0);
             const aliveChanged = !!remote.alive !== !!local.alive;
+            const speedBoostTickDiff = Math.abs((remote.speedBoostTicks || 0) - (local.speedBoostTicks || 0));
+            const shieldTickDiff = Math.abs((remote.shieldTicks || 0) - (local.shieldTicks || 0));
+            const attackBoostTickDiff = Math.abs((remote.attackBoostTicks || 0) - (local.attackBoostTicks || 0));
             const localCooldowns = local.cooldowns || [];
             const remoteCooldowns = remote.cooldowns || [];
             let cooldownL1 = 0;
@@ -465,6 +506,9 @@ export class GameScene {
                 invincibilityDiff > 0.01 ||
                 speedTierChanged ||
                 aliveChanged ||
+                speedBoostTickDiff > 0 ||
+                shieldTickDiff > 0 ||
+                attackBoostTickDiff > 0 ||
                 cooldownL1 > 0.01 ||
                 lastInputChanged;
 
@@ -478,6 +522,9 @@ export class GameScene {
             if (invincibilityDiff > 0.01) bump(fieldCounts, 'invincibilityTimer');
             if (speedTierChanged) bump(fieldCounts, 'speedTier');
             if (aliveChanged) bump(fieldCounts, 'alive');
+            if (speedBoostTickDiff > 0) bump(fieldCounts, 'speedBoostTicks');
+            if (shieldTickDiff > 0) bump(fieldCounts, 'shieldTicks');
+            if (attackBoostTickDiff > 0) bump(fieldCounts, 'attackBoostTicks');
             if (cooldownL1 > 0.01) bump(fieldCounts, 'cooldowns');
             if (lastInputChanged) bump(fieldCounts, 'lastInput');
 
@@ -489,6 +536,9 @@ export class GameScene {
                 healthDiff: Number(healthDiff.toFixed(3)),
                 knockbackDiff: Number(knockbackDiff.toFixed(3)),
                 cooldownL1: Number(cooldownL1.toFixed(3)),
+                speedBoostTickDiff,
+                shieldTickDiff,
+                attackBoostTickDiff,
                 speedTierChanged,
                 aliveChanged,
                 lastInputChanged,
@@ -530,6 +580,33 @@ export class GameScene {
         if (debrisLifeDiffCount > 0) bump(fieldCounts, 'debris_life');
         if (localDebris.length !== remoteDebris.length) bump(fieldCounts, 'debris_count');
 
+        const localPowerups = localWorld.getSortedPowerups ? localWorld.getSortedPowerups() : (localWorld.powerups || []);
+        const remotePowerups = remoteWorld.getSortedPowerups ? remoteWorld.getSortedPowerups() : (remoteWorld.powerups || []);
+        const minPowerups = Math.min(localPowerups.length, remotePowerups.length);
+        let powerupPosDiffCount = 0;
+        let powerupTypeDiffCount = 0;
+        let powerupLifetimeDiffCount = 0;
+        let powerupIdDiffCount = 0;
+
+        for (let i = 0; i < minPowerups; i++) {
+            const localPowerup = localPowerups[i];
+            const remotePowerup = remotePowerups[i];
+            if ((localPowerup.id || 0) !== (remotePowerup.id || 0)) powerupIdDiffCount++;
+            if ((localPowerup.typeId || 0) !== (remotePowerup.typeId || 0)) powerupTypeDiffCount++;
+            if (Math.hypot((remotePowerup.x || 0) - (localPowerup.x || 0), (remotePowerup.y || 0) - (localPowerup.y || 0)) > 0.01) {
+                powerupPosDiffCount++;
+            }
+            if (Math.abs((remotePowerup.despawnTicks || 0) - (localPowerup.despawnTicks || 0)) > 0) {
+                powerupLifetimeDiffCount++;
+            }
+        }
+
+        if (localPowerups.length !== remotePowerups.length) bump(fieldCounts, 'powerup_count');
+        if (powerupIdDiffCount > 0) bump(fieldCounts, 'powerup_id');
+        if (powerupTypeDiffCount > 0) bump(fieldCounts, 'powerup_type');
+        if (powerupPosDiffCount > 0) bump(fieldCounts, 'powerup_position');
+        if (powerupLifetimeDiffCount > 0) bump(fieldCounts, 'powerup_lifetime');
+
         return {
             localAvailable: true,
             localPlayerCount: localWorld.players.size,
@@ -545,6 +622,16 @@ export class GameScene {
                 lifeDiffCount: debrisLifeDiffCount,
                 maxPosDiff: Number(maxDebrisPosDiff.toFixed(3)),
             },
+            powerups: {
+                localCount: localPowerups.length,
+                remoteCount: remotePowerups.length,
+                idDiffCount: powerupIdDiffCount,
+                typeDiffCount: powerupTypeDiffCount,
+                posDiffCount: powerupPosDiffCount,
+                lifetimeDiffCount: powerupLifetimeDiffCount,
+                localSpawnTimer: localWorld.powerupSpawnTicksUntilNext || 0,
+                remoteSpawnTimer: remoteWorld.powerupSpawnTicksUntilNext || 0,
+            },
             dangerBorder: {
                 localPhase: this.getDangerBorderPhaseLabel(localBorder.phase || 0),
                 remotePhase: this.getDangerBorderPhaseLabel(remoteBorder.phase || 0),
@@ -552,6 +639,14 @@ export class GameScene {
                 remoteInset: Number(((remoteBorder.currentInset || 0)).toFixed(3)),
                 insetDiff: Number(borderInsetDiff.toFixed(3)),
                 elapsedTickDiff: borderElapsedDiff,
+            },
+            powerupConfig: {
+                localEnabled: !!localPowerupConfig.enabled,
+                remoteEnabled: !!remotePowerupConfig.enabled,
+                localMaxActive: localPowerupConfig.maxActive || 0,
+                remoteMaxActive: remotePowerupConfig.maxActive || 0,
+                localSpawnIntervalTicks: localPowerupConfig.spawnIntervalTicks || 0,
+                remoteSpawnIntervalTicks: remotePowerupConfig.spawnIntervalTicks || 0,
             },
         };
     }
@@ -624,6 +719,60 @@ export class GameScene {
             this._proceduralClouds = canvas;
         }
         return this._proceduralClouds;
+    }
+
+    getProceduralTexture(assetKey) {
+        const cached = this._proceduralTextureCache.get(assetKey);
+        if (cached) return cached;
+
+        const asset = assetManager.getAsset(assetKey);
+        if (!asset || asset.type !== 'texture' || asset.source !== 'procedural') {
+            return null;
+        }
+
+        const procedural = asset.procedural || {};
+        if (procedural.kind !== 'emoji-badge') {
+            return null;
+        }
+
+        const canvas = document.createElement('canvas');
+        const size = 128;
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext('2d');
+        const center = size / 2;
+        const radius = size * 0.34;
+
+        ctx.clearRect(0, 0, size, size);
+
+        ctx.fillStyle = procedural.glowStyle || 'rgba(255, 255, 255, 0.25)';
+        ctx.beginPath();
+        ctx.arc(center, center, size * 0.42, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = procedural.fillStyle || '#70A1FF';
+        ctx.beginPath();
+        ctx.arc(center, center, radius, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.lineWidth = 8;
+        ctx.strokeStyle = procedural.ringStyle || '#FFFFFF';
+        ctx.beginPath();
+        ctx.arc(center, center, radius + 4, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '72px "Apple Color Emoji", "Segoe UI Emoji", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(procedural.emoji || '?', center, center + 2);
+
+        this._proceduralTextureCache.set(assetKey, canvas);
+        return canvas;
+    }
+
+    getTextureImage(assetKey) {
+        return assetManager.getImage(assetKey) || this.getProceduralTexture(assetKey);
     }
 
     onEnter() {
@@ -1390,12 +1539,50 @@ export class GameScene {
             c.strokeRect(safeRectX, safeRectY, safeRectW, safeRectH);
         }
 
+        const powerupPickupRadius = this.worldState?.powerupConfig?.pickupRadius || 0;
+        const renderTick = this.session?.currentTick || 0;
+        for (const powerup of this.worldState.getSortedPowerups()) {
+            const assetKey = getPowerupAssetKey(powerup.typeId);
+            const texture = this.getTextureImage(assetKey);
+            const bobOffset = Math.sin((renderTick + powerup.id * 5) * 0.12) * 6 * s;
+            const pulse = 1 + (Math.sin((renderTick + powerup.id * 11) * 0.2) * 0.08);
+            const drawSize = Math.max(28 * s, powerupPickupRadius * 2.6 * s * pulse);
+            const px = renderOffsetX + powerup.x * s;
+            const py = renderOffsetY + powerup.y * s + bobOffset;
+
+            c.save();
+            c.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+            c.lineWidth = Math.max(1, 2 * s);
+            c.beginPath();
+            c.arc(px, py, powerupPickupRadius * s, 0, Math.PI * 2);
+            c.stroke();
+            c.restore();
+
+            if (texture) {
+                c.drawImage(texture, px - drawSize / 2, py - drawSize / 2, drawSize, drawSize);
+            } else {
+                c.fillStyle = '#FFFFFF';
+                c.beginPath();
+                c.arc(px, py, Math.max(10, powerupPickupRadius * s), 0, Math.PI * 2);
+                c.fill();
+            }
+        }
+
         // Render Ships
         for (const [id, pdata] of this.worldState.players) {
             const smooth = this.renderShipState.get(id);
             const renderPdata = smooth
-                ? { ...pdata, x: smooth.x, y: smooth.y, heading: smooth.heading }
-                : pdata;
+                ? {
+                    ...pdata,
+                    x: smooth.x,
+                    y: smooth.y,
+                    heading: smooth.heading,
+                    speedMultiplier: this.worldState.getPlayerSpeedMultiplier(pdata),
+                }
+                : {
+                    ...pdata,
+                    speedMultiplier: this.worldState.getPlayerSpeedMultiplier(pdata),
+                };
 
             // Keep render-only ship objects separate from simulation ship instances.
             let ship = this.renderShips.get(id);
@@ -1417,7 +1604,7 @@ export class GameScene {
         for (const d of this.worldState.debris) {
             let renderedWithSprite = false;
             if (d.spriteKey) {
-                const img = assetManager.getImage(d.spriteKey);
+                const img = this.getTextureImage(d.spriteKey);
                 if (img) {
                     const drawSize = d.radius * 2 * s;
                     c.drawImage(img, renderOffsetX + d.x * s - drawSize / 2, renderOffsetY + d.y * s - drawSize / 2, drawSize, drawSize);

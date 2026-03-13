@@ -86,9 +86,14 @@ export class Ship {
         this.cooldowns = stateData.cooldowns || [0, 0, 0, 0, 0];
         this.knockbackX = stateData.knockbackX || 0;
         this.knockbackY = stateData.knockbackY || 0;
+        this.speedBoostTicks = stateData.speedBoostTicks || 0;
+        this.shieldTicks = stateData.shieldTicks || 0;
+        this.attackBoostTicks = stateData.attackBoostTicks || 0;
 
         // Current real speed based on tier (1-indexed theoretically, 0 to N internally)
-        this.currentSpeed = this.def.speedTierValues[this.speedTier - 1] || this.def.speedTierValues[2];
+        const baseSpeed = this.def.speedTierValues[this.speedTier - 1] || this.def.speedTierValues[2];
+        const speedMultiplier = Number.isFinite(stateData.speedMultiplier) ? stateData.speedMultiplier : 1;
+        this.currentSpeed = baseSpeed * speedMultiplier;
     }
 
     toState() {
