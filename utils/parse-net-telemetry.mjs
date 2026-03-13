@@ -11,6 +11,15 @@ function safeNumber(v, fallback = 0) {
     return Number.isFinite(v) ? v : fallback;
 }
 
+function countBy(items, keyFn) {
+    const counts = new Map();
+    for (const item of items) {
+        const key = keyFn(item);
+        counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+}
+
 function summarizeHitchWindows(frameEvents) {
     const candidates = frameEvents.filter((e) =>
         e.phase === 'active' && (
@@ -102,6 +111,13 @@ function main() {
     const renderSnapEvents = events.filter((e) => e.type === 'render_snap');
     const syncStateDiffEvents = events.filter((e) => e.type === 'sync_state_diff');
     const staleInputDroppedEvents = events.filter((e) => e.type === 'stale_input_dropped');
+    const speculationStallEvents = events.filter((e) => e.type === 'speculation_stall');
+    const remoteInputEvents = events.filter((e) => e.type === 'remote_input_event');
+    const lateRemoteInputEvents = remoteInputEvents.filter((e) => e.phase === 'late_batch');
+    const syncEventsDetailed = events.filter((e) => e.type === 'sync_event');
+    const hashEvents = events.filter((e) => e.type === 'hash_event');
+    const transportEvents = events.filter((e) => e.type === 'transport_event');
+    const messageEvents = events.filter((e) => e.type === 'message_event');
 
     const maxWorstBehind = activeFrames.reduce((m, e) => Math.max(m, safeNumber(e.worstTicksBehind)), 0);
     const maxRttMs = activeFrames.reduce((m, e) => Math.max(m, safeNumber(e.maxRttMs)), 0);
@@ -134,6 +150,10 @@ function main() {
     console.log(`  catchUpClamped events: ${catchUpEvents.length}, renderSnap events: ${renderSnapEvents.length}`);
     console.log(`  syncStateDiff events: ${syncStateDiffEvents.length}`);
     console.log(`  staleInputDropped events: ${staleInputDroppedEvents.length}`);
+    console.log(`  speculationStall events: ${speculationStallEvents.length}`);
+    console.log(`  lateRemoteInput events: ${lateRemoteInputEvents.length}`);
+    console.log(`  sync events (detailed): ${syncEventsDetailed.length}, hash events: ${hashEvents.length}`);
+    console.log(`  transport events: ${transportEvents.length}, control message events: ${messageEvents.length}`);
     console.log('');
     console.log('Maxima');
     console.log(`  maxWorstBehindTicks: ${maxWorstBehind}`);
@@ -189,6 +209,94 @@ function main() {
             );
             if (playerSummary) {
                 console.log(`      players: ${playerSummary}`);
+            }
+        }
+    }
+    console.log('');
+
+    const syncPhaseCounts = countBy(syncEventsDetailed, (e) => e.phase || 'unknown');
+    const hashPhaseCounts = countBy(hashEvents, (e) => e.phase || 'unknown');
+    const transportActionCounts = countBy(transportEvents, (e) => e.action || 'unknown');
+    const transportErrorPhaseCounts = countBy(
+        transportEvents.filter((e) => e.action === 'error'),
+        (e) => e.phase || 'unknown'
+    );
+    const lateInputByPlayer = countBy(lateRemoteInputEvents, (e) => e.playerId || 'unknown');
+    const messageDirectionNameCounts = countBy(
+        messageEvents,
+        (e) => `${e.direction || '?'}:${e.messageName || e.messageType || 'unknown'}`
+    );
+
+    console.log('Diagnostics Summary');
+    if (speculationStallEvents.length === 0 &&
+        lateRemoteInputEvents.length === 0 &&
+        syncEventsDetailed.length === 0 &&
+        hashEvents.length === 0 &&
+        transportEvents.length === 0) {
+        console.log('  none');
+    } else {
+        if (syncPhaseCounts.length) {
+            console.log('  syncPhases:');
+            for (const [phase, count] of syncPhaseCounts) {
+                console.log(`    ${phase}: ${count}`);
+            }
+        }
+        if (hashPhaseCounts.length) {
+            console.log('  hashPhases:');
+            for (const [phase, count] of hashPhaseCounts) {
+                console.log(`    ${phase}: ${count}`);
+            }
+        }
+        if (transportActionCounts.length) {
+            console.log('  transportActions:');
+            for (const [action, count] of transportActionCounts) {
+                console.log(`    ${action}: ${count}`);
+            }
+        }
+        if (transportErrorPhaseCounts.length) {
+            console.log('  transportErrorPhases:');
+            for (const [phase, count] of transportErrorPhaseCounts) {
+                console.log(`    ${phase}: ${count}`);
+            }
+        }
+        if (speculationStallEvents.length) {
+            const maxSpecTicks = speculationStallEvents.reduce((m, e) => Math.max(m, safeNumber(e.speculationTicks)), 0);
+            const worstStall = speculationStallEvents
+                .slice()
+                .sort((a, b) => safeNumber(b.speculationTicks) - safeNumber(a.speculationTicks))[0];
+            console.log(`  speculationStalls: ${speculationStallEvents.length} (max speculationTicks=${maxSpecTicks})`);
+            if (worstStall) {
+                console.log(
+                    `    worst: tick=${worstStall.currentTick}` +
+                    ` minConfirmed=${worstStall.minConfirmedTick}` +
+                    ` slowPeer=${worstStall.slowestPlayerId || 'n/a'}` +
+                    ` slowPeerBehind=${safeNumber(worstStall.slowestTicksBehind)}`
+                );
+            }
+        }
+        if (lateRemoteInputEvents.length) {
+            const maxLateTicks = lateRemoteInputEvents.reduce((m, e) => Math.max(m, safeNumber(e.newestLatenessTicks)), 0);
+            console.log(`  lateRemoteInputs: ${lateRemoteInputEvents.length} (max newestLatenessTicks=${maxLateTicks})`);
+            if (lateInputByPlayer.length) {
+                console.log('  lateRemoteInputsByPlayer:');
+                for (const [playerId, count] of lateInputByPlayer.slice(0, 5)) {
+                    console.log(`    ${playerId}: ${count}`);
+                }
+            }
+        }
+        if (messageEvents.length) {
+            const maxIncomingBytes = messageEvents
+                .filter((e) => e.direction === 'in')
+                .reduce((m, e) => Math.max(m, safeNumber(e.byteLength)), 0);
+            const maxOutgoingBytes = messageEvents
+                .filter((e) => e.direction === 'out')
+                .reduce((m, e) => Math.max(m, safeNumber(e.encodedLength)), 0);
+            console.log(`  controlMessageSizes: inMax=${maxIncomingBytes}B outMax=${maxOutgoingBytes}B`);
+            if (messageDirectionNameCounts.length) {
+                console.log('  controlMessages:');
+                for (const [name, count] of messageDirectionNameCounts.slice(0, 10)) {
+                    console.log(`    ${name}: ${count}`);
+                }
             }
         }
     }

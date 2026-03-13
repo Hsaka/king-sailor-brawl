@@ -16,6 +16,23 @@ import { RollbackEngine } from './engine.js';
 
 const RATE_LIMIT_CLEANUP_INTERVAL_MS = 60000;
 const DEFAULT_LAG_REPORT_COOLDOWN_TICKS = 30;
+const MESSAGE_TYPE_NAMES = new Map(Object.entries(MessageType).map(([name, value]) => [value, name]));
+
+function messageTypeName(type) {
+    return MESSAGE_TYPE_NAMES.get(type) ?? `Unknown(${type})`;
+}
+
+function shouldLogMessageDiagnostics(message) {
+    switch (message?.type) {
+        case MessageType.Input:
+        case MessageType.Hash:
+        case MessageType.Ping:
+        case MessageType.Pong:
+            return false;
+        default:
+            return true;
+    }
+}
 
 function generateRoomId() {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -73,7 +90,8 @@ export class Session {
 
         this.transport.onMessage = (peerId, data) => this.handleMessage(peerId, data);
         this.transport.onConnect = (peerId) => this.handlePeerConnect(peerId);
-        this.transport.onDisconnect = (peerId) => this.handlePeerDisconnect(peerId);
+        this.transport.onDisconnect = (peerId, meta) => this.handlePeerDisconnect(peerId, meta);
+        this.transport.onError = (peerId, error, phase) => this.handleTransportError(peerId, error, phase);
         this.transport.onKeepalivePing = (peerId) => this.sendPing(peerId);
 
         this._state = SessionState.Disconnected;
@@ -149,6 +167,71 @@ export class Session {
                 }
             },
         });
+    }
+
+    emitDiagnostic(event, payload = {}) {
+        this.emit(event, {
+            currentTick: this.engine?.currentTick ?? -1,
+            confirmedTick: this.engine?.confirmedTick ?? -1,
+            inputEpoch: this.inputEpoch,
+            ...payload,
+        });
+    }
+
+    emitMessageDiagnostic(direction, message, payload = {}) {
+        if (!shouldLogMessageDiagnostics(message)) return;
+        this.emitDiagnostic('messageEvent', {
+            direction,
+            messageType: message?.type ?? null,
+            messageName: messageTypeName(message?.type),
+            ...payload,
+        });
+    }
+
+    summarizeInputBatch(inputs) {
+        if (!Array.isArray(inputs) || inputs.length === 0) {
+            return {
+                count: 0,
+                oldestTick: null,
+                newestTick: null,
+            };
+        }
+
+        let oldestTick = inputs[0].tick;
+        let newestTick = inputs[0].tick;
+        for (const entry of inputs) {
+            if (entry.tick < oldestTick) oldestTick = entry.tick;
+            if (entry.tick > newestTick) newestTick = entry.tick;
+        }
+
+        return {
+            count: inputs.length,
+            oldestTick,
+            newestTick,
+        };
+    }
+
+    getSlowestRemotePlayer() {
+        let slowest = null;
+        for (const player of this.playerManager.values()) {
+            if (player.id === this.localPlayerId) continue;
+            if (player.role !== PlayerRole.Player) continue;
+            if (player.connectionState !== PlayerConnectionState.Connected) continue;
+
+            const confirmedTick = this.engine.getConfirmedTickForPlayer(player.id);
+            if (confirmedTick === undefined) continue;
+
+            const ticksBehind = Math.max(0, this.engine.currentTick - confirmedTick);
+            if (!slowest || ticksBehind > slowest.ticksBehind) {
+                slowest = {
+                    playerId: player.id,
+                    confirmedTick,
+                    ticksBehind,
+                };
+            }
+        }
+
+        return slowest;
     }
 
     getJoinAcceptConfigPayload() {
@@ -236,6 +319,7 @@ export class Session {
         this.transport.onMessage = null;
         this.transport.onConnect = null;
         this.transport.onDisconnect = null;
+        this.transport.onError = null;
     }
 
     async createRoom() {
@@ -276,7 +360,7 @@ export class Session {
             this.broadcast(createPlayerLeft(this.localPlayerId, this.engine.currentTick), true);
         }
 
-        this.transport.disconnectAll();
+        this.transport.disconnectAll({ reason: 'leave_room' });
 
         this._roomId = null;
         this._isHost = false;
@@ -382,9 +466,22 @@ export class Session {
         const result = this.engine.tick();
         this.observeRollbackPressure(result);
 
+        if (result?.stalledReason === 'max_speculation') {
+            const slowest = this.getSlowestRemotePlayer();
+            this.emitDiagnostic('speculationStall', {
+                reason: result.stalledReason,
+                minConfirmedTick: result.minConfirmedTick ?? null,
+                speculationTicks: result.speculationTicks ?? null,
+                maxSpeculationTicks: result.maxSpeculationTicks ?? this.config.maxSpeculationTicks,
+                slowestPlayerId: slowest?.playerId ?? null,
+                slowestConfirmedTick: slowest?.confirmedTick ?? null,
+                slowestTicksBehind: slowest?.ticksBehind ?? null,
+            });
+        }
+
         if (result.error) {
             this.emit('error', result.error, { source: ErrorSource.Engine, recoverable: true, details: { tick: result.tick } });
-            if (!this._isHost) this.requestSync();
+            if (!this._isHost) this.requestSync('engine_error');
         }
 
         if (result.rolledBack && result.rollbackTicks !== undefined) {
@@ -399,19 +496,36 @@ export class Session {
         return result;
     }
 
-    requestSync() {
-        if (this._isHost) return;
+    requestSync(reason = 'unspecified') {
+        if (this._isHost) return false;
         const now = Date.now();
-        if (now - this.lastSyncRequestAtMs < this.syncRequestCooldownMs) return;
+        const elapsedMs = now - this.lastSyncRequestAtMs;
+        if (elapsedMs < this.syncRequestCooldownMs) {
+            this.emitDiagnostic('syncEvent', {
+                phase: 'request_skipped_cooldown',
+                reason,
+                elapsedMs,
+                cooldownMs: this.syncRequestCooldownMs,
+            });
+            return false;
+        }
         this.lastSyncRequestAtMs = now;
-        this.sendToHost(createSyncRequest(this.localPlayerId, this.engine.currentTick, this.engine.getCurrentHash()));
+        const localHash = this.engine.getCurrentHash();
+        this.emitDiagnostic('syncEvent', {
+            phase: 'request_sent',
+            reason,
+            desyncTick: this.engine.currentTick,
+            localHash,
+        });
+        this.sendToHost(createSyncRequest(this.localPlayerId, this.engine.currentTick, localHash));
+        return true;
     }
 
-    syncState() {
+    syncState(reason = 'manual') {
         if (!this._isHost) return;
         if (this._state !== SessionState.Playing && this._state !== SessionState.Paused) return;
 
-        this.advanceInputEpoch();
+        this.advanceInputEpoch(`sync_state:${reason}`);
 
         const state = this.engine.getState();
         for (const pt of state.playerTimeline) {
@@ -420,6 +534,13 @@ export class Session {
         }
         const syncMsg = createSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline, this.inputEpoch);
         this.broadcast(syncMsg, true);
+        this.emitDiagnostic('syncEvent', {
+            phase: 'broadcast',
+            reason,
+            syncTick: state.tick,
+            hash: syncMsg.hash,
+            playerCount: state.playerTimeline.length,
+        });
 
         // Keep host internals aligned with the same sync baseline it just sent.
         this.engine.resetForSync(state.tick, state.playerTimeline);
@@ -479,9 +600,22 @@ export class Session {
         try {
             message = decodeMessage(data);
         } catch (error) {
-            this.emit('error', error, { source: ErrorSource.Protocol, recoverable: true, details: { peerId } });
+            this.emit('error', error, {
+                source: ErrorSource.Protocol,
+                recoverable: true,
+                details: {
+                    peerId,
+                    byteLength: data?.byteLength ?? data?.length ?? 0,
+                    firstByte: typeof data?.[0] === 'number' ? data[0] : null,
+                },
+            });
             return;
         }
+
+        this.emitMessageDiagnostic('in', message, {
+            peerId,
+            byteLength: data?.byteLength ?? data?.length ?? 0,
+        });
 
         switch (message.type) {
             case MessageType.Input:
@@ -517,7 +651,7 @@ export class Session {
                 break;
             case MessageType.Resume:
                 this.setState(SessionState.Playing);
-                if (!this._isHost) this.requestSync();
+                if (!this._isHost) this.requestSync('resume');
                 break;
             case MessageType.Ping:
                 this.transport.handlePing?.(peerId, message.timestamp);
@@ -541,8 +675,16 @@ export class Session {
     }
 
     handleInputMessage(message) {
+        const summary = this.summarizeInputBatch(message.inputs);
         const messageEpoch = message.inputEpoch ?? 0;
         if (messageEpoch !== this.inputEpoch) {
+            this.emitDiagnostic('remoteInputEvent', {
+                phase: 'stale_epoch',
+                playerId: message.playerId,
+                messageEpoch,
+                expectedEpoch: this.inputEpoch,
+                ...summary,
+            });
             this.emit('staleInputDropped', {
                 playerId: message.playerId,
                 inputEpoch: messageEpoch,
@@ -556,10 +698,23 @@ export class Session {
             this.engine.receiveRemoteInput(message.playerId, tick, input);
         }
 
+        if (summary.newestTick !== null) {
+            const newestLatenessTicks = Math.max(0, this.engine.currentTick - summary.newestTick);
+            if (newestLatenessTicks > 0) {
+                this.emitDiagnostic('remoteInputEvent', {
+                    phase: 'late_batch',
+                    playerId: message.playerId,
+                    ...summary,
+                    newestLatenessTicks,
+                    oldestLatenessTicks: Math.max(0, this.engine.currentTick - summary.oldestTick),
+                });
+            }
+        }
+
         if (this._isHost && this.config.topology === Topology.Star) {
             for (const peerId of this.transport.connectedPeers) {
                 if (peerId !== message.playerId) {
-                    this.transport.send(peerId, encodeMessage(message), false);
+                    this.sendMessage(peerId, message, false, { forwardedByHost: true });
                 }
             }
         }
@@ -570,6 +725,13 @@ export class Session {
             tick: message.tick,
             playerId: message.playerId,
             hash: message.hash,
+        });
+        this.emitDiagnostic('hashEvent', {
+            phase: 'received',
+            playerId: message.playerId,
+            hashTick: message.tick,
+            hash: message.hash,
+            queueDepth: this.pendingHashMessages.length,
         });
     }
 
@@ -582,7 +744,16 @@ export class Session {
         const pruneThreshold = asTick(Math.max(0, currentTick - this.config.hashInterval * 2));
 
         for (const pending of this.pendingHashMessages) {
-            if (pending.tick < pruneThreshold) continue;
+            if (pending.tick < pruneThreshold) {
+                this.emitDiagnostic('hashEvent', {
+                    phase: 'pruned',
+                    playerId: pending.playerId,
+                    hashTick: pending.tick,
+                    hash: pending.hash,
+                    pruneThreshold,
+                });
+                continue;
+            }
 
             if (pending.tick > confirmedTick) {
                 remaining.push(pending);
@@ -590,9 +761,33 @@ export class Session {
             }
 
             const localHash = this.engine.getHash(pending.tick);
-            if (localHash !== undefined && localHash !== pending.hash) {
+            if (localHash === undefined) {
+                this.emitDiagnostic('hashEvent', {
+                    phase: 'missing_local_hash',
+                    playerId: pending.playerId,
+                    hashTick: pending.tick,
+                    remoteHash: pending.hash,
+                });
+                continue;
+            }
+
+            if (localHash !== pending.hash) {
+                this.emitDiagnostic('hashEvent', {
+                    phase: 'mismatch',
+                    playerId: pending.playerId,
+                    hashTick: pending.tick,
+                    localHash,
+                    remoteHash: pending.hash,
+                });
                 this.emit('desync', pending.tick, localHash, pending.hash);
-                if (!this._isHost) this.requestSync();
+                if (!this._isHost) this.requestSync('desync');
+            } else {
+                this.emitDiagnostic('hashEvent', {
+                    phase: 'match',
+                    playerId: pending.playerId,
+                    hashTick: pending.tick,
+                    hash: localHash,
+                });
             }
         }
 
@@ -622,6 +817,8 @@ export class Session {
             remoteState: remoteSnapshotState,
         });
 
+        const previousTick = this.engine.currentTick;
+        const previousInputEpoch = this.inputEpoch;
         this.inputEpoch = message.inputEpoch ?? this.inputEpoch;
         this.engine.setState(message.tick, message.state, message.playerTimeline);
         this.pendingHashMessages = [];
@@ -659,13 +856,32 @@ export class Session {
             this.emit('gameStart');
         }
 
+        this.emitDiagnostic('syncEvent', {
+            phase: 'applied',
+            syncTick: message.tick,
+            snapshotTick,
+            hash: message.hash,
+            previousTick,
+            previousInputEpoch,
+            previousHashAtSnapshotTick: localHashAtSnapshotTick ?? null,
+            playerCount: message.playerTimeline?.length ?? 0,
+            messageType: message.type,
+            messageName: messageTypeName(message.type),
+        });
         this.emit('synced', message.tick);
     }
 
     handleSyncRequest(message) {
         if (!this._isHost) return;
 
-        this.advanceInputEpoch();
+        this.emitDiagnostic('syncEvent', {
+            phase: 'request_received',
+            playerId: message.playerId,
+            desyncTick: message.desyncTick,
+            remoteHash: message.localHash,
+        });
+
+        this.advanceInputEpoch('sync_request');
 
         const state = this.engine.getState();
         for (const pt of state.playerTimeline) {
@@ -674,6 +890,14 @@ export class Session {
         }
         const syncMsg = createSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline, this.inputEpoch);
         this.broadcast(syncMsg, true);
+        this.emitDiagnostic('syncEvent', {
+            phase: 'broadcast',
+            reason: 'sync_request',
+            playerId: message.playerId,
+            syncTick: state.tick,
+            hash: syncMsg.hash,
+            playerCount: state.playerTimeline.length,
+        });
         this.engine.resetForSync(state.tick, state.playerTimeline);
         this.pendingHashMessages = [];
         this.lastSimulatedLocalInput = new Uint8Array(this.inputSizeBytes);
@@ -688,19 +912,19 @@ export class Session {
         const playerId = message.playerId;
 
         if (this.isRateLimited(peerId)) {
-            this.transport.send(peerId, encodeMessage(createJoinReject(playerId, 'Too many join requests, please wait')), true);
+            this.sendMessage(peerId, createJoinReject(playerId, 'Too many join requests, please wait'), true);
             return;
         }
 
         const connectedPlayers = Array.from(this.playerManager.values()).filter(p => p.connectionState === PlayerConnectionState.Connected);
         if (connectedPlayers.length >= this.config.maxPlayers) {
-            this.transport.send(peerId, encodeMessage(createJoinReject(playerId, 'Room is full')), true);
+            this.sendMessage(peerId, createJoinReject(playerId, 'Room is full'), true);
             return;
         }
 
         const playerIds = connectedPlayers.map(p => ({ id: p.id, name: p.name || '' }));
         const joinConfig = this.getJoinAcceptConfigPayload();
-        this.transport.send(peerId, encodeMessage(createJoinAccept(playerId, this._roomId, joinConfig, playerIds)), true);
+        this.sendMessage(peerId, createJoinAccept(playerId, this._roomId, joinConfig, playerIds), true);
 
         const playerRole = message.role ?? PlayerRole.Player;
         const playerInfo = {
@@ -729,7 +953,7 @@ export class Session {
                 const p = this.playerManager.get(pt.playerId);
                 if (p) pt.name = p.name;
             }
-            this.transport.send(peerId, encodeMessage(createStateSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline, this.inputEpoch)), true);
+            this.sendMessage(peerId, createStateSync(state.tick, state.state, this.engine.getCurrentHash(), state.playerTimeline, this.inputEpoch), true);
         }
 
         if (this._state === SessionState.Playing && playerInfo.joinTick !== null) {
@@ -842,11 +1066,37 @@ export class Session {
         if (player) {
             player.connectionState = PlayerConnectionState.Connected;
         }
+        this.emitDiagnostic('transportEvent', {
+            action: 'peer_connected',
+            peerId,
+            playerId,
+        });
     }
 
-    handlePeerDisconnect(peerId) {
+    handlePeerDisconnect(peerId, meta = {}) {
         const playerId = asPlayerId(peerId);
+        this.emitDiagnostic('transportEvent', {
+            action: 'peer_disconnected',
+            peerId,
+            playerId,
+            ...meta,
+        });
         this.markPlayerDisconnected(playerId);
+    }
+
+    handleTransportError(peerId, error, phase) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        this.emit('error', err, {
+            source: ErrorSource.Transport,
+            recoverable: true,
+            details: { peerId, phase },
+        });
+        this.emitDiagnostic('transportEvent', {
+            action: 'error',
+            peerId,
+            phase,
+            message: err.message,
+        });
     }
 
     markPlayerDisconnected(playerId) {
@@ -913,6 +1163,12 @@ export class Session {
             if (hash === undefined) return;
 
             this.broadcast(createHash(this.localPlayerId, hashTick, hash), true);
+            this.emitDiagnostic('hashEvent', {
+                phase: 'broadcast',
+                playerId: this.localPlayerId,
+                hashTick,
+                hash,
+            });
         }
     }
 
@@ -932,8 +1188,15 @@ export class Session {
         this.broadcast(createInput(this.localPlayerId, inputs, this.inputEpoch), false);
     }
 
-    advanceInputEpoch() {
+    advanceInputEpoch(reason = 'unspecified') {
+        const previousInputEpoch = this.inputEpoch;
         this.inputEpoch = (this.inputEpoch + 1) & 0xFFFF;
+        this.emitDiagnostic('syncEvent', {
+            phase: 'input_epoch_advanced',
+            reason,
+            previousInputEpoch,
+            inputEpoch: this.inputEpoch,
+        });
     }
 
     sendPing(peerId) {
@@ -1060,23 +1323,47 @@ export class Session {
         this.lastSimulatedLocalInput = this.cloneInput(simulatedInput);
     }
 
+    sendMessage(peerId, message, reliable = isReliableMessage(message), payload = {}) {
+        const encoded = encodeMessage(message);
+        this.emitMessageDiagnostic('out', message, {
+            peerId,
+            reliable,
+            encodedLength: encoded.byteLength ?? encoded.length ?? 0,
+            ...payload,
+        });
+        return this.transport.send(peerId, encoded, reliable);
+    }
+
     broadcast(message, reliable) {
         const encoded = encodeMessage(message);
+        this.emitMessageDiagnostic('out', message, {
+            scope: 'broadcast',
+            reliable,
+            peerCount: this.transport.connectedPeers?.size ?? 0,
+            encodedLength: encoded.byteLength ?? encoded.length ?? 0,
+        });
         this.transport.broadcast(encoded, reliable);
     }
 
     sendToHost(message) {
         const host = Array.from(this.playerManager.values()).find(p => p.isHost);
         if (host && host.id !== this.localPlayerId) {
-            this.transport.send(host.id, encodeMessage(message), isReliableMessage(message));
+            this.sendMessage(host.id, message, isReliableMessage(message), { scope: 'host' });
             return;
         }
 
         const peers = this.transport.connectedPeers;
         if (peers.size > 0) {
             const hostPeerId = peers.values().next().value;
-            this.transport.send(hostPeerId, encodeMessage(message), isReliableMessage(message));
+            this.sendMessage(hostPeerId, message, isReliableMessage(message), { scope: 'host_fallback' });
+            return;
         }
+
+        this.emitDiagnostic('transportEvent', {
+            action: 'host_route_missing',
+            messageType: message?.type ?? null,
+            messageName: messageTypeName(message?.type),
+        });
     }
 
     isRateLimited(peerId) {

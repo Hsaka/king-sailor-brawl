@@ -108,6 +108,34 @@ function createEngine(world) {
     return engine;
 }
 
+test('rollback engine reports max-speculation stalls explicitly', () => {
+    const engine = new RollbackEngine({
+        game: createRollbackWorld(),
+        localPlayerId: 'p1',
+        snapshotHistorySize: 32,
+        maxSpeculationTicks: 4,
+        inputSizeBytes: 3,
+    });
+    engine.addPlayer('p2', 0);
+
+    for (let tick = 0; tick < 3; tick++) {
+        engine.setLocalInput(tick, packInput(0x10));
+        const result = engine.tick();
+        assert.equal(result.stalledReason, undefined, `tick ${tick} should still advance`);
+    }
+
+    const tickBefore = engine.currentTick;
+    engine.setLocalInput(tickBefore, packInput(0x10));
+    const stalled = engine.tick();
+
+    assert.equal(stalled.stalledReason, 'max_speculation');
+    assert.equal(stalled.tick, tickBefore);
+    assert.equal(stalled.speculationTicks, 4);
+    assert.equal(stalled.maxSpeculationTicks, 4);
+    assert.equal(stalled.minConfirmedTick, -1);
+    assert.equal(engine.currentTick, tickBefore, 'engine should not advance when max speculation is hit');
+});
+
 test('world state hash covers the full serialized state and round-trips cleanly', () => {
     const world = createCombatWorld();
 

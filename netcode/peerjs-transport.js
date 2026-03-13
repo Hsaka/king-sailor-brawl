@@ -126,7 +126,7 @@ export class PeerJSTransport {
         });
 
         conn.on('close', () => {
-            this.handleDisconnect(peerId);
+            this.handleDisconnect(peerId, { reason: 'connection_closed' });
         });
 
         conn.on('error', (err) => {
@@ -173,11 +173,13 @@ export class PeerJSTransport {
             if (this.connectionTimeout > 0) {
                 peerData.connectionTimer = setTimeout(() => {
                     if (!peerData.isConnected && peerData.connectionReject) {
-                        peerData.connectionReject(new Error(`Connection to ${peerId} timed out`));
+                        const error = new Error(`Connection to ${peerId} timed out`);
+                        peerData.connectionReject(error);
                         peerData.connectionResolve = null;
                         peerData.connectionReject = null;
                         peerData.connectionTimer = null;
-                        this.cleanupPeer(peerId);
+                        this.onError?.(peerId, error, 'connect_timeout');
+                        this.cleanupPeer(peerId, { reason: 'connect_timeout' });
                     }
                 }, this.connectionTimeout);
             }
@@ -187,8 +189,9 @@ export class PeerJSTransport {
                 peerData.connection = conn;
                 this.setupConnection(peerId, conn);
             } catch (err) {
+                const error = err instanceof Error ? err : new Error(String(err));
                 if (peerData.connectionReject) {
-                    peerData.connectionReject(err);
+                    peerData.connectionReject(error);
                     peerData.connectionResolve = null;
                     peerData.connectionReject = null;
                 }
@@ -196,23 +199,24 @@ export class PeerJSTransport {
                     clearTimeout(peerData.connectionTimer);
                     peerData.connectionTimer = null;
                 }
-                this.cleanupPeer(peerId);
+                this.onError?.(peerId, error, 'connect_failed');
+                this.cleanupPeer(peerId, { reason: 'connect_failed' });
             }
         });
 
         return peerData.connectionPromise;
     }
 
-    disconnect(peerId) {
+    disconnect(peerId, meta = { reason: 'manual_disconnect' }) {
         const peerData = this.peers.get(peerId);
         if (peerData) {
-            this.cleanupPeer(peerId);
+            this.cleanupPeer(peerId, meta);
         }
     }
 
-    disconnectAll() {
+    disconnectAll(meta = { reason: 'disconnect_all' }) {
         for (const peerId of [...this.peers.keys()]) {
-            this.disconnect(peerId);
+            this.disconnect(peerId, meta);
         }
         this.stopKeepaliveTimer();
     }
@@ -220,13 +224,16 @@ export class PeerJSTransport {
     send(peerId, message, reliable) {
         const peerData = this.peers.get(peerId);
         if (!peerData || !peerData.isConnected || !peerData.connection) {
-            return;
+            this.onError?.(peerId, new Error(`Cannot send to ${peerId}: not connected`), 'send_unavailable');
+            return false;
         }
 
         try {
             peerData.connection.send(message);
+            return true;
         } catch (err) {
             this.onError?.(peerId, err, 'send');
+            return false;
         }
     }
 
@@ -236,7 +243,7 @@ export class PeerJSTransport {
         }
     }
 
-    handleDisconnect(peerId) {
+    handleDisconnect(peerId, meta = { reason: 'disconnect' }) {
         const peerData = this.peers.get(peerId);
         if (!peerData) return;
 
@@ -255,14 +262,14 @@ export class PeerJSTransport {
         }
 
         if (wasConnected) {
-            this.onDisconnect?.(peerId);
+            this.onDisconnect?.(peerId, meta);
         }
 
         this.peers.delete(peerId);
         this.peerMetrics.delete(peerId);
     }
 
-    cleanupPeer(peerId) {
+    cleanupPeer(peerId, meta = { reason: 'cleanup' }) {
         const peerData = this.peers.get(peerId);
         if (!peerData) return;
 
@@ -287,12 +294,12 @@ export class PeerJSTransport {
         }
 
         if (wasConnected) {
-            this.onDisconnect?.(peerId);
+            this.onDisconnect?.(peerId, meta);
         }
     }
 
     destroy() {
-        this.disconnectAll();
+        this.disconnectAll({ reason: 'destroy' });
         this.stopKeepaliveTimer();
         this.peerMetrics.clear();
     }
@@ -390,7 +397,11 @@ export class PeerJSTransport {
             if (metrics && now - metrics.lastResponseTime > this.keepaliveTimeout) {
                 const peerData = this.peers.get(peerId);
                 if (peerData) {
-                    this.handleDisconnect(peerId);
+                    this.handleDisconnect(peerId, {
+                        reason: 'keepalive_timeout',
+                        idleMs: now - metrics.lastResponseTime,
+                        keepaliveTimeoutMs: this.keepaliveTimeout,
+                    });
                 }
                 continue;
             }

@@ -50,6 +50,12 @@ export class GameScene {
         this._sessionSyncPayloadHandler = null;
         this._sessionStateChangeHandler = null;
         this._sessionErrorHandler = null;
+        this._sessionSpeculationStallHandler = null;
+        this._sessionRemoteInputHandler = null;
+        this._sessionHashEventHandler = null;
+        this._sessionSyncEventHandler = null;
+        this._sessionTransportEventHandler = null;
+        this._sessionMessageEventHandler = null;
         this._autoPausedForHidden = false;
         this._visibilityHandler = null;
         this.renderShipState = new Map();
@@ -116,6 +122,29 @@ export class GameScene {
             worstTicksBehind: 0,
             teleportSnapsLastFrame: 0,
             rollbackSnapTeleportsLastFrame: 0,
+            speculationStalls: 0,
+            lastStallReason: '',
+            lastStallSpeculationTicks: 0,
+            lastSlowPeerId: '',
+            lastSlowPeerTicksBehind: 0,
+            lateRemoteInputBatches: 0,
+            maxLateRemoteInputTicks: 0,
+            lastLateRemoteInputPlayerId: '',
+            lastLateRemoteInputTicks: 0,
+            hashMatches: 0,
+            hashMismatches: 0,
+            hashPruned: 0,
+            lastHashPhase: '',
+            lastHashTick: -1,
+            transportErrors: 0,
+            transportDisconnects: 0,
+            lastTransportPeerId: '',
+            lastTransportReason: '',
+            lastTransportPhase: '',
+            syncCooldownSkips: 0,
+            inputEpochAdvances: 0,
+            lastSyncPhase: '',
+            lastSyncReason: '',
         };
     }
 
@@ -588,10 +617,15 @@ export class GameScene {
             this.session.on('synced', this._sessionSyncHandler);
         }
         if (!this._sessionInputDelayHandler) {
-            this._sessionInputDelayHandler = (delayTicks) => {
+            this._sessionInputDelayHandler = (delayTicks, meta) => {
                 this.netDebug.inputDelayTicks = delayTicks;
                 this.recordTelemetry('input_delay_changed', {
                     delayTicks,
+                    worstRttMs: meta?.worstRttMs ?? null,
+                    worstJitterMs: meta?.worstJitterMs ?? null,
+                    worstInputLagTicks: meta?.worstInputLagTicks ?? null,
+                    rollbackPressure: meta?.rollbackPressure ?? null,
+                    targetDelay: meta?.targetDelay ?? null,
                     currentTick: this.session ? this.session.currentTick : -1,
                 });
             };
@@ -672,6 +706,83 @@ export class GameScene {
             };
             this.session.on('error', this._sessionErrorHandler);
         }
+        if (!this._sessionSpeculationStallHandler) {
+            this._sessionSpeculationStallHandler = (meta) => {
+                this.netDebug.speculationStalls++;
+                this.netDebug.lastStallReason = meta?.reason || '';
+                this.netDebug.lastStallSpeculationTicks = meta?.speculationTicks || 0;
+                this.netDebug.lastSlowPeerId = meta?.slowestPlayerId || '';
+                this.netDebug.lastSlowPeerTicksBehind = meta?.slowestTicksBehind || 0;
+                this.recordTelemetry('speculation_stall', {
+                    ...this.safeClone(meta),
+                });
+            };
+            this.session.on('speculationStall', this._sessionSpeculationStallHandler);
+        }
+        if (!this._sessionRemoteInputHandler) {
+            this._sessionRemoteInputHandler = (meta) => {
+                if (meta?.phase === 'late_batch') {
+                    this.netDebug.lateRemoteInputBatches++;
+                    const lateTicks = meta?.newestLatenessTicks || 0;
+                    this.netDebug.lastLateRemoteInputPlayerId = meta?.playerId || '';
+                    this.netDebug.lastLateRemoteInputTicks = lateTicks;
+                    this.netDebug.maxLateRemoteInputTicks = Math.max(this.netDebug.maxLateRemoteInputTicks, lateTicks);
+                }
+                this.recordTelemetry('remote_input_event', {
+                    ...this.safeClone(meta),
+                });
+            };
+            this.session.on('remoteInputEvent', this._sessionRemoteInputHandler);
+        }
+        if (!this._sessionHashEventHandler) {
+            this._sessionHashEventHandler = (meta) => {
+                const phase = meta?.phase || '';
+                this.netDebug.lastHashPhase = phase;
+                this.netDebug.lastHashTick = meta?.hashTick ?? this.netDebug.lastHashTick;
+                if (phase === 'match') this.netDebug.hashMatches++;
+                if (phase === 'mismatch') this.netDebug.hashMismatches++;
+                if (phase === 'pruned') this.netDebug.hashPruned++;
+                this.recordTelemetry('hash_event', {
+                    ...this.safeClone(meta),
+                });
+            };
+            this.session.on('hashEvent', this._sessionHashEventHandler);
+        }
+        if (!this._sessionSyncEventHandler) {
+            this._sessionSyncEventHandler = (meta) => {
+                const phase = meta?.phase || '';
+                this.netDebug.lastSyncPhase = phase;
+                this.netDebug.lastSyncReason = meta?.reason || '';
+                if (phase === 'request_skipped_cooldown') this.netDebug.syncCooldownSkips++;
+                if (phase === 'input_epoch_advanced') this.netDebug.inputEpochAdvances++;
+                this.recordTelemetry('sync_event', {
+                    ...this.safeClone(meta),
+                });
+            };
+            this.session.on('syncEvent', this._sessionSyncEventHandler);
+        }
+        if (!this._sessionTransportEventHandler) {
+            this._sessionTransportEventHandler = (meta) => {
+                const action = meta?.action || '';
+                if (action === 'error') this.netDebug.transportErrors++;
+                if (action === 'peer_disconnected') this.netDebug.transportDisconnects++;
+                this.netDebug.lastTransportPeerId = meta?.peerId || meta?.playerId || '';
+                this.netDebug.lastTransportReason = meta?.reason || meta?.message || '';
+                this.netDebug.lastTransportPhase = meta?.phase || action;
+                this.recordTelemetry('transport_event', {
+                    ...this.safeClone(meta),
+                });
+            };
+            this.session.on('transportEvent', this._sessionTransportEventHandler);
+        }
+        if (!this._sessionMessageEventHandler) {
+            this._sessionMessageEventHandler = (meta) => {
+                this.recordTelemetry('message_event', {
+                    ...this.safeClone(meta),
+                });
+            };
+            this.session.on('messageEvent', this._sessionMessageEventHandler);
+        }
         const local = this.worldState.players.get(this.worldState.localPlayerId);
         if (local) {
             this.camX = local.x;
@@ -712,7 +823,7 @@ export class GameScene {
         if (this.session.isHost) {
             if (this._autoPausedForHidden && this.session.state === SessionState.Paused) {
                 this.recordTelemetry('visibility_resume_host', { action: 'sync_resume', currentTick: this.session.currentTick });
-                this.session.syncState?.();
+                this.session.syncState?.('visibility_resume');
                 this.session.resume();
             }
             this._autoPausedForHidden = false;
@@ -720,7 +831,7 @@ export class GameScene {
             this._awaitingSync = true;
             this._lastSyncRequestAtMs = performance.now();
             this.trackSyncRequest('visibility_resume');
-            this.session.requestSync?.();
+            this.session.requestSync?.('visibility_resume');
         }
 
         this.resetSimulationClock(this.session.currentTick);
@@ -911,7 +1022,7 @@ export class GameScene {
             const nowMs = performance.now();
             if (nowMs - this._lastSyncRequestAtMs > 600) {
                 this.trackSyncRequest('awaiting_sync_retry');
-                this.session.requestSync?.();
+                this.session.requestSync?.('awaiting_sync_retry');
                 this._lastSyncRequestAtMs = nowMs;
             }
             this.netDebug.desiredTicks = Math.max(0, this.getDesiredCurrentTick(nowMs) - this.session.currentTick);
@@ -930,6 +1041,10 @@ export class GameScene {
                 worstTicksBehind: this.netDebug.worstTicksBehind,
                 maxRttMs: Number(this.netDebug.maxRttMs.toFixed(2)),
                 maxJitterMs: Number(this.netDebug.maxJitterMs.toFixed(2)),
+                speculationStalls: this.netDebug.speculationStalls,
+                transportErrors: this.netDebug.transportErrors,
+                lateRemoteInputBatches: this.netDebug.lateRemoteInputBatches,
+                hashMismatches: this.netDebug.hashMismatches,
             });
             this.maybeLogPeerMetrics(nowMs);
             this.updateRenderShipState();
@@ -1007,6 +1122,9 @@ export class GameScene {
                     desiredTicks,
                     iteration: i,
                     confirmedTick: this.session.confirmedTick,
+                    stalledReason: result?.stalledReason ?? null,
+                    speculationTicks: result?.speculationTicks ?? null,
+                    minConfirmedTick: result?.minConfirmedTick ?? null,
                 });
             }
         }
@@ -1019,6 +1137,7 @@ export class GameScene {
             phase: 'active',
             currentTick: this.session.currentTick,
             confirmedTick: this.session.confirmedTick,
+            localAhead: Math.max(0, this.session.currentTick - (this.session.confirmedTick + 1)),
             desiredTicks,
             ticksToProcess,
             ticksProcessed,
@@ -1033,6 +1152,14 @@ export class GameScene {
             maxJitterMs: Number(this.netDebug.maxJitterMs.toFixed(2)),
             teleportSnaps: this.netDebug.teleportSnapsLastFrame,
             rollbackSnapTeleports: this.netDebug.rollbackSnapTeleportsLastFrame,
+            speculationStalls: this.netDebug.speculationStalls,
+            lastStallReason: this.netDebug.lastStallReason,
+            lastStallSpeculationTicks: this.netDebug.lastStallSpeculationTicks,
+            lateRemoteInputBatches: this.netDebug.lateRemoteInputBatches,
+            maxLateRemoteInputTicks: this.netDebug.maxLateRemoteInputTicks,
+            hashMismatches: this.netDebug.hashMismatches,
+            transportErrors: this.netDebug.transportErrors,
+            transportDisconnects: this.netDebug.transportDisconnects,
         });
         this.maybeLogPeerMetrics(now);
 
@@ -1358,21 +1485,28 @@ export class GameScene {
             `desired/proc ${dbg.desiredTicks}/${dbg.ticksProcessed}  clamp ${dbg.catchUpClamped ? 'Y' : 'N'}`,
             `rb/s ${dbg.rollbacksPerSec.toFixed(1)}  rbTicks/s ${dbg.rollbackTicksPerSec.toFixed(1)}  maxRb ${dbg.maxRollbackTicks}`,
             `totRb ${dbg.totalRollbacks}  totRbTicks ${dbg.totalRollbackTicks}  stallTicks ${dbg.stalledTicks}`,
+            `stallEv ${dbg.speculationStalls}  last ${dbg.lastStallReason || '-'}  spec ${dbg.lastStallSpeculationTicks}`,
             `snaps tele ${dbg.teleportSnapsLastFrame}  rbTele ${dbg.rollbackSnapTeleportsLastFrame}`,
             `inputDelay ${dbg.inputDelayTicks}t  worstBehind ${dbg.worstTicksBehind}t`,
             `maxRTT ${Math.round(dbg.maxRttMs)}ms  maxJitter ${Math.round(dbg.maxJitterMs)}ms`,
             `sync ${dbg.syncEvents} (req ${dbg.syncRequests}) lastSync ${dbg.lastSyncTick}`,
+            `syncPhase ${dbg.lastSyncPhase || '-'}  reason ${dbg.lastSyncReason || '-'}`,
             `desync ${dbg.desyncEvents} last ${dbg.lastDesyncTick} lagReports ${dbg.lagReports}`,
-            `staleInputs ${dbg.staleInputsDropped}`,
+            `staleInputs ${dbg.staleInputsDropped}  lateIn ${dbg.lateRemoteInputBatches} maxLate ${dbg.maxLateRemoteInputTicks}`,
+            `hash ok/mm/pr ${dbg.hashMatches}/${dbg.hashMismatches}/${dbg.hashPruned} last ${dbg.lastHashPhase || '-'}@${dbg.lastHashTick}`,
+            `transport err/disc ${dbg.transportErrors}/${dbg.transportDisconnects} ${dbg.lastTransportPhase || '-'} ${dbg.lastTransportReason || '-'}`,
         ];
         if (dbg.lastLaggyPlayerId) {
             lines.push(`lastLag ${dbg.lastLaggyPlayerId.slice(0, 8)} ${dbg.lastLagTicksBehind}t`);
+        }
+        if (dbg.lastSlowPeerId) {
+            lines.push(`slowPeer ${dbg.lastSlowPeerId.slice(0, 8)} ${dbg.lastSlowPeerTicksBehind}t`);
         }
 
         const lineHeight = 15 * s;
         const textSize = 12 * s;
         const padding = 10 * s;
-        const panelWidth = 430 * s;
+        const panelWidth = 560 * s;
         const panelHeight = padding * 2 + lineHeight * lines.length;
         const x = sw - panelWidth - 18 * s;
         const y = 70 * s;
@@ -1438,6 +1572,30 @@ export class GameScene {
         if (this._sessionErrorHandler && this.session) {
             this.session.off('error', this._sessionErrorHandler);
             this._sessionErrorHandler = null;
+        }
+        if (this._sessionSpeculationStallHandler && this.session) {
+            this.session.off('speculationStall', this._sessionSpeculationStallHandler);
+            this._sessionSpeculationStallHandler = null;
+        }
+        if (this._sessionRemoteInputHandler && this.session) {
+            this.session.off('remoteInputEvent', this._sessionRemoteInputHandler);
+            this._sessionRemoteInputHandler = null;
+        }
+        if (this._sessionHashEventHandler && this.session) {
+            this.session.off('hashEvent', this._sessionHashEventHandler);
+            this._sessionHashEventHandler = null;
+        }
+        if (this._sessionSyncEventHandler && this.session) {
+            this.session.off('syncEvent', this._sessionSyncEventHandler);
+            this._sessionSyncEventHandler = null;
+        }
+        if (this._sessionTransportEventHandler && this.session) {
+            this.session.off('transportEvent', this._sessionTransportEventHandler);
+            this._sessionTransportEventHandler = null;
+        }
+        if (this._sessionMessageEventHandler && this.session) {
+            this.session.off('messageEvent', this._sessionMessageEventHandler);
+            this._sessionMessageEventHandler = null;
         }
         this.renderShipState.clear();
         this.renderShips.clear();
