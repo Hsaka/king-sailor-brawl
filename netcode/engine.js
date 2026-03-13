@@ -62,7 +62,7 @@ export class RollbackEngine {
         if (!this.snapshotBuffer.has(asTick(-1))) {
             const tick = asTick(-1);
             const state = this.gameSerialize(tick);
-            const hash = this.gameHash(tick);
+            const hash = this.gameHash(tick, state);
             this.snapshotBuffer.save(tick, state, hash);
         }
     }
@@ -85,7 +85,7 @@ export class RollbackEngine {
         this.gameStep(this._currentTick, inputs);
 
         const state = this.gameSerialize(this._currentTick);
-        const hash = this.gameHash(this._currentTick);
+        const hash = this.gameHash(this._currentTick, state);
         this.snapshotBuffer.save(this._currentTick, state, hash);
 
         this.updateConfirmedTick();
@@ -159,7 +159,7 @@ export class RollbackEngine {
             this.gameStep(tickAsTick, inputs);
 
             const state = this.gameSerialize(tickAsTick);
-            const hash = this.gameHash(tickAsTick);
+            const hash = this.gameHash(tickAsTick, state);
             this.snapshotBuffer.save(tickAsTick, state, hash);
         }
 
@@ -234,7 +234,8 @@ export class RollbackEngine {
 
     getCurrentHash() {
         const latestStateTick = asTick(this._currentTick - 1);
-        return this.gameHash(latestStateTick);
+        const snapshot = this.snapshotBuffer.get(latestStateTick);
+        return snapshot?.hash ?? this.gameHash(latestStateTick);
     }
 
     getState() {
@@ -274,7 +275,7 @@ export class RollbackEngine {
         this.inputBuffer.setConfirmedTickForSync(tick);
 
         const snapshotTick = asTick(tick - 1);
-        const hash = this.gameHash(snapshotTick);
+        const hash = this.gameHash(snapshotTick, state);
         this.snapshotBuffer.save(snapshotTick, state, hash);
 
         this._currentTick = tick;
@@ -297,7 +298,7 @@ export class RollbackEngine {
 
         const snapshotTick = asTick(tick - 1);
         const state = this.gameSerialize(snapshotTick);
-        const hash = this.gameHash(snapshotTick);
+        const hash = this.gameHash(snapshotTick, state);
         this.snapshotBuffer.save(snapshotTick, state, hash);
 
         this._currentTick = tick;
@@ -345,8 +346,8 @@ export class RollbackEngine {
         this.wrapGameOperation('deserialize', tick, () => this.game.deserialize(state));
     }
 
-    gameHash(tick) {
-        return this.wrapGameOperation('hash', tick, () => this.game.hash());
+    gameHash(tick, state) {
+        return this.wrapGameOperation('hash', tick, () => this.game.hash(state));
     }
 
     createNeutralInput() {

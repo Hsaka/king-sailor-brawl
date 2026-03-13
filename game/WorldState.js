@@ -2,6 +2,18 @@ import { Ship } from './Ship.js';
 import { ShipDefinitions } from './ShipDefinitions.js';
 import { CONFIG } from '../config.js';
 
+const FNV_OFFSET_BASIS_32 = 0x811c9dc5;
+const FNV_PRIME_32 = 0x01000193;
+
+function hashBytesFNV1a(bytes) {
+    let hash = FNV_OFFSET_BASIS_32;
+    for (let i = 0; i < bytes.length; i++) {
+        hash ^= bytes[i];
+        hash = Math.imul(hash, FNV_PRIME_32);
+    }
+    return hash >>> 0;
+}
+
 export class WorldState {
     constructor() {
         this.players = new Map();
@@ -23,6 +35,35 @@ export class WorldState {
         t = Math.imul(t ^ (t >>> 15), t | 1);
         t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
         return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    }
+
+    quantizeState() {
+        for (const [, player] of this.players) {
+            player.x = Math.fround(player.x || 0);
+            player.y = Math.fround(player.y || 0);
+            player.heading = Math.fround(player.heading || 0);
+            player.health = Math.fround(player.health || 0);
+            player.invincibilityTimer = Math.fround(player.invincibilityTimer || 0);
+            player.slowTimer = Math.fround(player.slowTimer || 0);
+            player.knockbackX = Math.fround(player.knockbackX || 0);
+            player.knockbackY = Math.fround(player.knockbackY || 0);
+
+            const cooldowns = player.cooldowns || (player.cooldowns = [0, 0, 0, 0, 0]);
+            for (let i = 0; i < cooldowns.length; i++) {
+                cooldowns[i] = Math.fround(cooldowns[i] || 0);
+            }
+        }
+
+        for (const debris of this.debris) {
+            debris.x = Math.fround(debris.x || 0);
+            debris.y = Math.fround(debris.y || 0);
+            debris.vx = Math.fround(debris.vx || 0);
+            debris.vy = Math.fround(debris.vy || 0);
+            debris.life = Math.fround(debris.life || 0);
+            debris.damage = Math.fround(debris.damage || 0);
+            debris.radius = Math.fround(debris.radius || 0);
+            debris.duration = Math.fround(debris.duration || 0);
+        }
     }
 
     getSortedPlayerEntries() {
@@ -61,6 +102,8 @@ export class WorldState {
             p.knockbackY = 0;
             this.lastInput.set(id, 0);
         }
+
+        this.quantizeState();
     }
 
     setLocalPlayerId(id) {
@@ -98,6 +141,7 @@ export class WorldState {
             knockbackY: 0
         });
         this.lastInput.set(id, 0);
+        this.quantizeState();
     }
 
     addBot(id, slotIndex, shipId = 'cobro') {
@@ -284,6 +328,8 @@ export class WorldState {
                 spriteKey: debrisConfig.spriteKey || null
             });
         }
+
+        this.quantizeState();
     }
 
     computeBotInput(id, dt) {
@@ -412,6 +458,7 @@ export class WorldState {
 
             if (flags & 0x200) {
                 this.resetLevel();
+                this.quantizeState();
                 return; // Level reset, skip rest of tick
             }
 
@@ -688,24 +735,12 @@ export class WorldState {
                 }
             }
         }
+
+        this.quantizeState();
     }
 
-    hash() {
-        let h = this.seed;
-        for (const [id, p] of this.getSortedPlayerEntries()) {
-            h = ((h << 5) - h + Math.floor(p.x * 10)) | 0;
-            h = ((h << 5) - h + Math.floor(p.y * 10)) | 0;
-            h = ((h << 5) - h + Math.floor(p.health * 10)) | 0;
-            h = ((h << 5) - h + Math.floor((p.knockbackX || 0) * 10)) | 0;
-            h = ((h << 5) - h + Math.floor((p.knockbackY || 0) * 10)) | 0;
-            h = ((h << 5) - h + Math.floor((p.slowTimer || 0) * 10)) | 0;
-            h = ((h << 5) - h + (this.lastInput.get(id) || 0)) | 0;
-        }
-        for (const d of this.debris) {
-            h = ((h << 5) - h + Math.floor(d.x * 10)) | 0;
-            h = ((h << 5) - h + Math.floor(d.y * 10)) | 0;
-            h = ((h << 5) - h + Math.floor(d.life * 10)) | 0;
-        }
-        return h >>> 0;
+    hash(serializedState) {
+        const bytes = serializedState instanceof Uint8Array ? serializedState : this.serialize();
+        return hashBytesFNV1a(bytes);
     }
 }

@@ -1,7 +1,5 @@
 import { ShipDefinitions } from './ShipDefinitions.js';
 import { CONFIG } from '../config.js';
-import { mainContext } from '../littlejs.esm.min.js';
-import { game } from '../App.js';
 
 export class Ship {
     constructor(playerId, stateData) {

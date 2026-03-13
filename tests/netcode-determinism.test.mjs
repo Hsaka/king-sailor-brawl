@@ -1,0 +1,212 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+globalThis.window = globalThis.window || {};
+
+const [{ WorldState }, { ShipDefinitions }, { RollbackEngine }] = await Promise.all([
+    import('../game/WorldState.js'),
+    import('../game/ShipDefinitions.js'),
+    import('../netcode/engine.js'),
+]);
+
+function packInput(flags) {
+    return new Uint8Array([
+        flags & 0xFF,
+        (flags >> 8) & 0xFF,
+        (flags >> 16) & 0xFF,
+    ]);
+}
+
+function assertStateBytesEqual(actual, expected, message) {
+    assert.equal(Buffer.from(actual).compare(Buffer.from(expected)), 0, message);
+}
+
+function setPlayerState(world, playerId, overrides) {
+    const player = world.players.get(playerId);
+    assert.ok(player, `missing player ${playerId}`);
+
+    Object.assign(player, {
+        x: 0,
+        y: 0,
+        heading: 0,
+        speedTier: ShipDefinitions.get(player.shipId).defaultSpeedTier,
+        health: ShipDefinitions.get(player.shipId).maxHealth,
+        alive: true,
+        isBot: false,
+        invincibilityTimer: 0,
+        slowTimer: 0,
+        cooldowns: [0, 0, 0, 0, 0],
+        knockbackX: 0,
+        knockbackY: 0,
+        ...overrides,
+    });
+}
+
+function createCombatWorld() {
+    const world = new WorldState();
+    world.seed = 424242;
+    world.setLocalPlayerId('p1');
+    world.addPlayer('p1', 0);
+    world.addPlayer('p2', 1);
+    world.setPlayerShip('p1', 'cobro');
+    world.setPlayerShip('p2', 'cobro');
+
+    setPlayerState(world, 'p1', {
+        x: 500,
+        y: 500,
+        heading: 0,
+        speedTier: 1,
+    });
+    setPlayerState(world, 'p2', {
+        x: 580,
+        y: 500,
+        heading: 0,
+        speedTier: 1,
+    });
+
+    world.lastInput.set('p1', 0);
+    world.lastInput.set('p2', 0);
+    return world;
+}
+
+function createRollbackWorld() {
+    const world = new WorldState();
+    world.seed = 98765;
+    world.setLocalPlayerId('p1');
+    world.addPlayer('p1', 0);
+    world.addPlayer('p2', 1);
+    world.setPlayerShip('p1', 'cobro');
+    world.setPlayerShip('p2', 'cobro');
+
+    setPlayerState(world, 'p1', {
+        x: 300,
+        y: 300,
+        heading: 0,
+        speedTier: 1,
+    });
+    setPlayerState(world, 'p2', {
+        x: 1000,
+        y: 1000,
+        heading: 180,
+        speedTier: 1,
+    });
+
+    world.lastInput.set('p1', 0);
+    world.lastInput.set('p2', 0);
+    return world;
+}
+
+function createEngine(world) {
+    const engine = new RollbackEngine({
+        game: world,
+        localPlayerId: 'p1',
+        snapshotHistorySize: 120,
+        maxSpeculationTicks: 60,
+        inputSizeBytes: 3,
+    });
+    engine.addPlayer('p2', 0);
+    return engine;
+}
+
+test('world state hash covers the full serialized state and round-trips cleanly', () => {
+    const world = createCombatWorld();
+
+    const baselineBytes = world.serialize();
+    const baselineHash = world.hash(baselineBytes);
+
+    const headingChanged = createCombatWorld();
+    headingChanged.players.get('p1').heading += 37;
+    assert.notEqual(headingChanged.hash(headingChanged.serialize()), baselineHash, 'heading changes must affect hash');
+
+    const cooldownChanged = createCombatWorld();
+    cooldownChanged.players.get('p2').cooldowns[1] = 1.25;
+    assert.notEqual(cooldownChanged.hash(cooldownChanged.serialize()), baselineHash, 'cooldown changes must affect hash');
+
+    const debrisChanged = createCombatWorld();
+    debrisChanged.spawnDebris(640, 640, ShipDefinitions.get('cobro').debris);
+    const debrisHash = debrisChanged.hash(debrisChanged.serialize());
+    assert.notEqual(debrisHash, baselineHash, 'debris changes must affect hash');
+
+    const roundTrip = new WorldState();
+    roundTrip.deserialize(baselineBytes);
+    const roundTripBytes = roundTrip.serialize();
+    assertStateBytesEqual(roundTripBytes, baselineBytes, 'serialize/deserialize round-trip should be byte-stable');
+    assert.equal(roundTrip.hash(roundTripBytes), baselineHash, 'round-tripped state should hash identically');
+});
+
+test('two peers remain byte-identical under the same scripted simulation', () => {
+    const worldA = createCombatWorld();
+    const worldB = createCombatWorld();
+
+    worldA.spawnDebris(640, 640, ShipDefinitions.get('cobro').debris);
+    worldB.spawnDebris(640, 640, ShipDefinitions.get('cobro').debris);
+
+    for (let tick = 0; tick < 150; tick++) {
+        const p1Flags = 0x10;
+        const p2Flags = tick % 45 === 0 ? 0x20 : 0;
+        const inputs = new Map([
+            ['p1', packInput(p1Flags)],
+            ['p2', packInput(p2Flags)],
+        ]);
+
+        worldA.step(inputs);
+        worldB.step(inputs);
+
+        const bytesA = worldA.serialize();
+        const bytesB = worldB.serialize();
+        assertStateBytesEqual(bytesA, bytesB, `peer states diverged at tick ${tick}`);
+        assert.equal(worldA.hash(bytesA), worldB.hash(bytesB), `peer hashes diverged at tick ${tick}`);
+    }
+});
+
+test('rollback engine converges back to the authoritative state after delayed remote inputs', () => {
+    const authoritative = createEngine(createRollbackWorld());
+    const predicted = createEngine(createRollbackWorld());
+    const remoteInputs = [];
+    const delayTicks = 4;
+    const totalTicks = 64;
+    let sawRollback = false;
+
+    for (let tick = 0; tick < totalTicks; tick++) {
+        const localFlags = tick % 8 < 4 ? 0x10 : 0x00;
+        const remoteFlags = ((tick % 6) < 3 ? 0x01 : 0x02) | (tick % 10 === 0 ? 0x20 : 0x00);
+        const localInput = packInput(localFlags);
+        const remoteInput = packInput(remoteFlags);
+        remoteInputs.push(remoteInput);
+
+        authoritative.setLocalInput(tick, localInput);
+        authoritative.receiveRemoteInput('p2', tick, remoteInput);
+        authoritative.tick();
+
+        predicted.setLocalInput(tick, localInput);
+        if (tick >= delayTicks) {
+            predicted.receiveRemoteInput('p2', tick - delayTicks, remoteInputs[tick - delayTicks]);
+        }
+
+        const result = predicted.tick();
+        sawRollback ||= !!result?.rolledBack;
+    }
+
+    for (let tick = totalTicks - delayTicks; tick < totalTicks; tick++) {
+        predicted.receiveRemoteInput('p2', tick, remoteInputs[tick]);
+    }
+
+    for (let i = 0; i < delayTicks; i++) {
+        authoritative.setLocalInput(totalTicks + i, packInput(0));
+        authoritative.receiveRemoteInput('p2', totalTicks + i, packInput(0));
+        authoritative.tick();
+
+        predicted.setLocalInput(totalTicks + i, packInput(0));
+        predicted.receiveRemoteInput('p2', totalTicks + i, packInput(0));
+        const result = predicted.tick();
+        sawRollback ||= !!result?.rolledBack;
+    }
+
+    assert.ok(sawRollback, 'delayed inputs should have forced at least one rollback');
+    assert.equal(predicted.currentTick, authoritative.currentTick, 'engines should end on the same tick');
+
+    const authoritativeState = authoritative.getState().state;
+    const predictedState = predicted.getState().state;
+    assertStateBytesEqual(predictedState, authoritativeState, 'predicted engine should converge to the authoritative state');
+    assert.equal(predicted.getCurrentHash(), authoritative.getCurrentHash(), 'authoritative and predicted hashes should match after convergence');
+});
