@@ -3,10 +3,20 @@ import assert from 'node:assert/strict';
 
 globalThis.window = globalThis.window || {};
 
-const [{ WorldState }, { ShipDefinitions }, { RollbackEngine }] = await Promise.all([
+const [
+    { WorldState },
+    { ShipDefinitions },
+    { RollbackEngine },
+    { Session },
+    { decodeMessage },
+    { MessageType },
+] = await Promise.all([
     import('../game/WorldState.js'),
     import('../game/ShipDefinitions.js'),
     import('../netcode/engine.js'),
+    import('../netcode/session.js'),
+    import('../netcode/encoding.js'),
+    import('../netcode/messages.js'),
 ]);
 
 function packInput(flags) {
@@ -108,6 +118,79 @@ function createEngine(world) {
     return engine;
 }
 
+class FakeTransport {
+    constructor(localPeerId = 'p1') {
+        this.localPeerId = localPeerId;
+        this._connectedPeers = new Set(['p2']);
+        this.sent = [];
+        this.broadcasts = [];
+        this.onMessage = null;
+        this.onConnect = null;
+        this.onDisconnect = null;
+        this.onError = null;
+        this.onKeepalivePing = null;
+    }
+
+    get connectedPeers() {
+        return this._connectedPeers;
+    }
+
+    send(peerId, message, reliable) {
+        this.sent.push({ peerId, message: new Uint8Array(message), reliable });
+        return true;
+    }
+
+    broadcast(message, reliable) {
+        this.broadcasts.push({ message: new Uint8Array(message), reliable });
+        for (const peerId of this._connectedPeers) {
+            this.sent.push({ peerId, message: new Uint8Array(message), reliable, via: 'broadcast' });
+        }
+    }
+
+    disconnectAll() {
+        this._connectedPeers.clear();
+    }
+
+    getConnectionMetrics() {
+        return { rtt: 0, jitter: 0, packetLoss: 0, lastUpdated: Date.now() };
+    }
+
+    recordPeerResponse() { }
+}
+
+function createHashSession() {
+    const world = createRollbackWorld();
+    const transport = new FakeTransport('p1');
+    const session = new Session({
+        game: world,
+        transport,
+        localPlayerId: 'p1',
+        config: {
+            hashInterval: 60,
+            adaptiveInputDelay: false,
+        },
+    });
+    session.playerManager.set('p2', {
+        id: 'p2',
+        name: 'p2',
+        connectionState: 1,
+        joinTick: 0,
+        leaveTick: null,
+        isHost: false,
+        role: 0,
+        rtt: 0,
+    });
+    return { session, transport, world };
+}
+
+function seedSessionSnapshot(session, world, tick) {
+    const state = world.serialize();
+    session.engine.setState(tick, state, [
+        { playerId: 'p1', joinTick: 0, leaveTick: null },
+        { playerId: 'p2', joinTick: 0, leaveTick: null },
+    ]);
+}
+
 test('rollback engine reports max-speculation stalls explicitly', () => {
     const engine = new RollbackEngine({
         game: createRollbackWorld(),
@@ -134,6 +217,61 @@ test('rollback engine reports max-speculation stalls explicitly', () => {
     assert.equal(stalled.maxSpeculationTicks, 4);
     assert.equal(stalled.minConfirmedTick, -1);
     assert.equal(engine.currentTick, tickBefore, 'engine should not advance when max speculation is hit');
+});
+
+test('session defers hash broadcast until the local snapshot exists', (t) => {
+    const { session, transport, world } = createHashSession();
+    t.after(() => session.destroy());
+    seedSessionSnapshot(session, world, 58);
+
+    session.engine._confirmedTick = 61;
+    session.maybeBroadcastHash();
+
+    assert.equal(transport.broadcasts.length, 0, 'hash should not broadcast before the local snapshot exists');
+    assert.equal(session.lastHashBroadcastTick, -1, 'broadcast watermark should not advance on a deferred hash');
+
+    const hashState = world.serialize();
+    const hash = world.hash(hashState);
+    session.engine.snapshotBuffer.save(60, hashState, hash);
+    session.engine._currentTick = 61;
+    session.engine._confirmedTick = 62;
+
+    session.maybeBroadcastHash();
+
+    assert.equal(transport.broadcasts.length, 1, 'hash should broadcast once the local snapshot becomes available');
+    assert.equal(session.lastHashBroadcastTick, 60);
+
+    const message = decodeMessage(transport.broadcasts[0].message);
+    assert.equal(message.type, MessageType.Hash);
+    assert.equal(message.tick, 60);
+    assert.equal(message.hash, hash);
+});
+
+test('session keeps pending hash comparisons queued until the local hash exists', (t) => {
+    const { session, world } = createHashSession();
+    t.after(() => session.destroy());
+    seedSessionSnapshot(session, world, 58);
+
+    const phases = [];
+    session.on('hashEvent', (meta) => phases.push(meta.phase));
+
+    const hashState = world.serialize();
+    const hash = world.hash(hashState);
+    session.pendingHashMessages = [{ tick: 60, playerId: 'p2', hash }];
+    session.engine._confirmedTick = 61;
+
+    session.processPendingHashComparisons();
+
+    assert.deepEqual(session.pendingHashMessages, [{ tick: 60, playerId: 'p2', hash }], 'future hash should remain queued');
+    assert.ok(phases.includes('awaiting_local_hash'));
+
+    session.engine.snapshotBuffer.save(60, hashState, hash);
+    session.engine._currentTick = 61;
+    session.engine._confirmedTick = 62;
+    session.processPendingHashComparisons();
+
+    assert.equal(session.pendingHashMessages.length, 0, 'hash should clear once the local snapshot is available');
+    assert.ok(phases.includes('match'));
 });
 
 test('world state hash covers the full serialized state and round-trips cleanly', () => {

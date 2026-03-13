@@ -742,6 +742,8 @@ export class Session {
         const confirmedTick = this.engine.confirmedTick;
         const remaining = [];
         const pruneThreshold = asTick(Math.max(0, currentTick - this.config.hashInterval * 2));
+        const oldestLocalHashTick = this.engine.snapshotBuffer?.oldestTick;
+        const newestLocalHashTick = this.engine.snapshotBuffer?.newestTick;
 
         for (const pending of this.pendingHashMessages) {
             if (pending.tick < pruneThreshold) {
@@ -762,12 +764,18 @@ export class Session {
 
             const localHash = this.engine.getHash(pending.tick);
             if (localHash === undefined) {
+                const awaitingLocalHash = newestLocalHashTick === undefined || pending.tick > newestLocalHashTick;
                 this.emitDiagnostic('hashEvent', {
-                    phase: 'missing_local_hash',
+                    phase: awaitingLocalHash ? 'awaiting_local_hash' : 'missing_local_hash',
                     playerId: pending.playerId,
                     hashTick: pending.tick,
                     remoteHash: pending.hash,
+                    oldestLocalHashTick: oldestLocalHashTick ?? null,
+                    newestLocalHashTick: newestLocalHashTick ?? null,
                 });
+                if (awaitingLocalHash) {
+                    remaining.push(pending);
+                }
                 continue;
             }
 
@@ -1154,14 +1162,24 @@ export class Session {
 
     maybeBroadcastHash() {
         const confirmedTick = this.engine.confirmedTick;
-        const hashTick = asTick(Math.floor(confirmedTick / this.config.hashInterval) * this.config.hashInterval);
+        const latestSimulatedTick = asTick(this.engine.currentTick - 1);
+        const maxHashableTick = asTick(Math.min(confirmedTick, latestSimulatedTick));
+        const hashTick = asTick(Math.floor(maxHashableTick / this.config.hashInterval) * this.config.hashInterval);
 
         if (hashTick > 0 && hashTick !== this.lastHashBroadcastTick) {
-            this.lastHashBroadcastTick = hashTick;
-
             const hash = this.engine.getHash(hashTick);
-            if (hash === undefined) return;
+            if (hash === undefined) {
+                this.emitDiagnostic('hashEvent', {
+                    phase: 'broadcast_deferred',
+                    playerId: this.localPlayerId,
+                    hashTick,
+                    confirmedTick,
+                    latestSimulatedTick,
+                });
+                return;
+            }
 
+            this.lastHashBroadcastTick = hashTick;
             this.broadcast(createHash(this.localPlayerId, hashTick, hash), true);
             this.emitDiagnostic('hashEvent', {
                 phase: 'broadcast',
