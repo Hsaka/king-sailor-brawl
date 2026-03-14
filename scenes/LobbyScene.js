@@ -35,6 +35,7 @@ export class LobbyScene {
         this.playerList = [];
         this.localSelectedShip = 'cobro';
         this.selectedShips = new Map();
+        this.readyStates = new Map();
         this.ships = CONFIG.SHIPS;
         this.shipIndex = this.ships.findIndex(s => s.id === 'cobro') || 0;
     }
@@ -108,6 +109,7 @@ export class LobbyScene {
                 this.worldState.setLocalPlayerId(id);
                 this.worldState.addPlayer(id, 0); // Slot 0
                 this.selectedShips.set(id, this.localSelectedShip);
+                this.readyStates.set(id, false);
                 this.worldState.setPlayerShip(id, this.localSelectedShip);
 
                 this.transport = new PeerJSTransport(id);
@@ -154,7 +156,10 @@ export class LobbyScene {
             this.connectionStatus = 'Creating peer (Client)...';
             this.peer = new Peer();
             this.peer.on('open', async (id) => {
+                this.peerId = id;
                 this.worldState.setLocalPlayerId(id);
+                this.selectedShips.set(id, this.localSelectedShip);
+                this.readyStates.set(id, false);
                 // The host syncs the state which includes player slots.
                 this.transport = new PeerJSTransport(id);
                 this.transport.setPeerInstance(this.peer);
@@ -222,7 +227,15 @@ export class LobbyScene {
                 if (this.isHost) {
                     this.broadcastShip(data.peerId, data.shipId);
                 }
+            } else if (data.type === 'readyState') {
+                this.readyStates.set(data.peerId, !!data.ready);
+                if (this.isHost) {
+                    this.broadcastReadyState(data.peerId, !!data.ready);
+                }
             } else if (data.type === 'initialShips') {
+                const myId = this.getLocalPeerId();
+                const localReady = myId ? this.readyStates.get(myId) === true : false;
+
                 for (const [pId, sId] of Object.entries(data.ships)) {
                     this.selectedShips.set(pId, sId);
                     if (!this.worldState.players.has(pId)) {
@@ -230,13 +243,17 @@ export class LobbyScene {
                     }
                     this.worldState.setPlayerShip(pId, sId);
                 }
+                for (const [pId, ready] of Object.entries(data.readyStates || {})) {
+                    this.readyStates.set(pId, !!ready);
+                }
 
                 // Ensure the client re-applies their chosen ship
-                const myId = this.getLocalPeerId();
                 if (myId) {
                     this.selectedShips.set(myId, this.localSelectedShip);
+                    this.readyStates.set(myId, localReady);
                     this.worldState.setPlayerShip(myId, this.localSelectedShip);
                     this.broadcastShip(myId, this.localSelectedShip);
+                    this.broadcastReadyState(myId, localReady);
                 }
             }
         };
@@ -244,6 +261,15 @@ export class LobbyScene {
 
     getLocalPeerId() {
         return this.peer?.id || this.session?.localPlayerId || this.peerId || null;
+    }
+
+    isPlayerReady(playerId) {
+        return this.readyStates.get(playerId) === true;
+    }
+
+    isLocalReady() {
+        const localPeerId = this.getLocalPeerId();
+        return localPeerId ? this.isPlayerReady(localPeerId) : false;
     }
 
     getHostPeerId() {
@@ -266,6 +292,22 @@ export class LobbyScene {
         return null;
     }
 
+    getConnectedRemotePlayerIds() {
+        if (!this.session) return [];
+        return Array.from(this.session.players.entries())
+            .filter(([id, player]) => player.connectionState === PlayerConnectionState.Connected && !player.isHost && id !== this.getLocalPeerId())
+            .map(([id]) => id);
+    }
+
+    getReadyRemotePlayerCount() {
+        return this.getConnectedRemotePlayerIds().filter(id => this.isPlayerReady(id)).length;
+    }
+
+    canHostStartMatch() {
+        const remotePlayerIds = this.getConnectedRemotePlayerIds();
+        return remotePlayerIds.length === 0 || remotePlayerIds.every(id => this.isPlayerReady(id));
+    }
+
     broadcastShip(peerId, shipId) {
         if (!this.transport) return;
         const msg = { __customData: true, type: 'shipSelect', peerId, shipId };
@@ -279,7 +321,24 @@ export class LobbyScene {
         }
     }
 
+    broadcastReadyState(peerId, ready) {
+        if (!this.transport) return;
+        const msg = { __customData: true, type: 'readyState', peerId, ready: !!ready };
+        if (this.isHost) {
+            this.transport.broadcast(msg, true);
+        } else {
+            const hostPeerId = this.getHostPeerId();
+            if (hostPeerId) {
+                this.transport.send(hostPeerId, msg, true);
+            }
+        }
+    }
+
     changeShip(direction) {
+        if (!this.isHost && this.isLocalReady()) {
+            return;
+        }
+
         this.shipIndex = (this.shipIndex + direction + this.ships.length) % this.ships.length;
         this.localSelectedShip = this.ships[this.shipIndex].id;
 
@@ -291,13 +350,31 @@ export class LobbyScene {
         }
     }
 
+    toggleReady() {
+        if (this.isHost) return;
+
+        const myId = this.getLocalPeerId();
+        if (!myId) return;
+
+        const nextReadyState = !this.isLocalReady();
+        this.readyStates.set(myId, nextReadyState);
+        if (nextReadyState) {
+            this.selectedShips.set(myId, this.localSelectedShip);
+            this.worldState.setPlayerShip(myId, this.localSelectedShip);
+            this.broadcastShip(myId, this.localSelectedShip);
+        }
+        this.broadcastReadyState(myId, nextReadyState);
+    }
+
     setupSessionListeners() {
         this.session.on('playerJoined', (player) => {
             if (!this.worldState.players.has(player.id)) {
                 this.worldState.addPlayer(player.id, this.worldState.players.size);
             }
             const selectedShip = this.selectedShips.get(player.id) || 'cobro';
+            const readyState = this.readyStates.get(player.id) === true;
             this.selectedShips.set(player.id, selectedShip);
+            this.readyStates.set(player.id, readyState);
             this.worldState.setPlayerShip(player.id, selectedShip);
 
             // Broadcast and coordinate if host
@@ -307,18 +384,24 @@ export class LobbyScene {
                 for (const [id, p] of this.worldState.players) {
                     shipMap[id] = this.selectedShips.get(id) || p.shipId;
                 }
+                const readyMap = {};
+                for (const [id] of this.worldState.players) {
+                    readyMap[id] = this.readyStates.get(id) === true;
+                }
                 // Small delay to ensure the client is ready to receive
                 setTimeout(() => {
-                    this.transport.send(player.id, { __customData: true, type: 'initialShips', ships: shipMap }, true);
+                    this.transport.send(player.id, { __customData: true, type: 'initialShips', ships: shipMap, readyStates: readyMap }, true);
                 }, 100);
 
                 this.broadcastShip(player.id, selectedShip);
+                this.broadcastReadyState(player.id, readyState);
             }
         });
 
         this.session.on('playerLeft', (player) => {
             this.worldState.removePlayer(player.id);
             this.selectedShips.delete(player.id);
+            this.readyStates.delete(player.id);
             if (player.isHost && !this.isHost) {
                 this.disconnect('Host disconnected from the session.');
             }
@@ -357,22 +440,26 @@ export class LobbyScene {
         this.playerList = [];
 
         // Ensure absolute truth by cross-referencing with our actual peer connection ID and the room code we joined
-        const myActualId = this.peer ? this.peer.id : this.session.localPlayerId;
-        const hostActualId = this.isHost ? myActualId : this.session.roomId;
+        const myActualId = this.getLocalPeerId();
+        const hostActualId = this.getHostPeerId();
 
         for (const [id, player] of this.session.players) {
             if (player.connectionState === PlayerConnectionState.Disconnected) continue;
 
             const isLocal = id === myActualId;
-            const isHost = id === hostActualId;
+            const isHost = player.isHost || id === hostActualId;
 
             const statePlayer = this.worldState.players.get(id);
+            let connectionLabel = 'Connecting...';
+            if (player.connectionState === PlayerConnectionState.Connected) {
+                connectionLabel = !isHost && this.isPlayerReady(id) ? 'Ready' : 'Connected';
+            }
             this.playerList.push({
                 id: player.name || id.slice(0, 6),
                 fullId: id,
                 isHost,
                 isLocal,
-                state: player.connectionState === PlayerConnectionState.Connected ? 'Connected' : 'Connecting...',
+                state: connectionLabel,
                 ship: statePlayer ? statePlayer.shipId : '...',
             });
         }
@@ -434,6 +521,8 @@ export class LobbyScene {
         this.peerId = null;
         this.connectionStatus = 'Disconnected';
         this.playerList = [];
+        this.selectedShips.clear();
+        this.readyStates.clear();
 
         game.session = null;
         game.worldState = null;
@@ -526,7 +615,11 @@ export class LobbyScene {
             const label = `${p.id} ${p.isLocal ? '(You)' : ''} ${p.isHost ? '👑' : ''}`;
             drawScreenText(label, rightX + 70 * s, y + 27 * s, 18 * s, '#FFF', 'left', 'middle', 'Arial', true);
 
-            const stateColor = p.state === 'Connected' ? hexCss(CONFIG.UI.COLORS.SUCCESS) : '#CCC';
+            const stateColor = p.state === 'Ready'
+                ? hexCss(CONFIG.UI.COLORS.SUCCESS)
+                : p.state === 'Connected'
+                    ? '#CCC'
+                    : '#AAA';
             drawScreenText(p.state, rightX + cardWidth - 40 * s, y + 27 * s, 14 * s, stateColor, 'right', 'middle', 'Arial', true);
         });
 
@@ -542,45 +635,67 @@ export class LobbyScene {
             const panelH = 120 * s;
             const panelX = cx - panelW / 2;
             const panelY = btnY - 170 * s;
+            const shipSelectionLocked = !this.isHost && this.isLocalReady();
 
             draw3DCard(panelX, panelY, panelW, panelH);
             drawScreenText('Select Ship', cx, panelY + 20 * s, 16 * s, '#CCC', 'center', 'middle');
             drawScreenText(ship.name, cx, panelY + 55 * s, 26 * s, hexCss(CONFIG.UI.COLORS.GOLD), 'center', 'middle', 'Arial', true);
-            drawScreenText(ship.description, cx, panelY + 90 * s, 14 * s, '#AAA', 'center', 'middle');
+            drawScreenText(shipSelectionLocked ? 'Ship locked. Choose Not Ready to change.' : ship.description, cx, panelY + 90 * s, 14 * s, shipSelectionLocked ? hexCss(CONFIG.UI.COLORS.WARNING) : '#AAA', 'center', 'middle');
 
             // Arrows
             const arrowSize = 44 * s;
             const leftArrowX = panelX - arrowSize - 15 * s;
             const rightArrowX = panelX + panelW + 15 * s;
+            const arrowColor = shipSelectionLocked ? CONFIG.UI.COLORS.PANEL_SHADOW : CONFIG.UI.COLORS.PRIMARY;
 
-            draw3DButton(leftArrowX, panelY + panelH / 2 - arrowSize / 2, arrowSize, arrowSize, '◀', CONFIG.UI.COLORS.PRIMARY, false, this._hovered?.id === 'prev_ship');
-            draw3DButton(rightArrowX, panelY + panelH / 2 - arrowSize / 2, arrowSize, arrowSize, '▶', CONFIG.UI.COLORS.PRIMARY, false, this._hovered?.id === 'next_ship');
+            draw3DButton(leftArrowX, panelY + panelH / 2 - arrowSize / 2, arrowSize, arrowSize, '◀', arrowColor, false, !shipSelectionLocked && this._hovered?.id === 'prev_ship');
+            draw3DButton(rightArrowX, panelY + panelH / 2 - arrowSize / 2, arrowSize, arrowSize, '▶', arrowColor, false, !shipSelectionLocked && this._hovered?.id === 'next_ship');
 
-            regBtn(leftArrowX, panelY + panelH / 2 - arrowSize / 2, arrowSize, arrowSize, 'prev_ship', () => this.changeShip(-1));
-            regBtn(rightArrowX, panelY + panelH / 2 - arrowSize / 2, arrowSize, arrowSize, 'next_ship', () => this.changeShip(1));
+            if (!shipSelectionLocked) {
+                regBtn(leftArrowX, panelY + panelH / 2 - arrowSize / 2, arrowSize, arrowSize, 'prev_ship', () => this.changeShip(-1));
+                regBtn(rightArrowX, panelY + panelH / 2 - arrowSize / 2, arrowSize, arrowSize, 'next_ship', () => this.changeShip(1));
+            }
 
             if (this.isHost) {
-                draw3DButton(cx - btnW / 2, btnY, btnW, btnH, 'START MATCH', CONFIG.UI.COLORS.GOLD, false, this._hovered?.id === 'start');
-                regBtn(cx - btnW / 2, btnY, btnW, btnH, 'start', () => {
-                    for (const [id] of this.worldState.players) {
-                        const shipId = this.selectedShips.get(id);
-                        if (shipId) {
-                            this.worldState.setPlayerShip(id, shipId);
+                const remotePlayerIds = this.getConnectedRemotePlayerIds();
+                if (this.canHostStartMatch()) {
+                    draw3DButton(cx - btnW / 2, btnY, btnW, btnH, 'START MATCH', CONFIG.UI.COLORS.GOLD, false, this._hovered?.id === 'start');
+                    regBtn(cx - btnW / 2, btnY, btnW, btnH, 'start', () => {
+                        for (const [id] of this.worldState.players) {
+                            const shipId = this.selectedShips.get(id);
+                            if (shipId) {
+                                this.worldState.setPlayerShip(id, shipId);
+                            }
                         }
-                    }
-                    if (this.session.players.size <= 1) {
-                        const numBots = CONFIG.COMBAT.BOT_COUNT;
-                        const botNames = ['Bot1', 'Bot2', 'Bot3'];
-                        for (let i = 0; i < numBots; i++) {
-                            const botId = botNames[i] || `Bot${i + 1}`;
-                            const nextSlot = this.worldState.players.size;
-                            this.worldState.addBot(botId, nextSlot, this.ships[Math.floor(Math.random() * this.ships.length)].id);
+                        if (this.session.players.size <= 1) {
+                            const numBots = CONFIG.COMBAT.BOT_COUNT;
+                            const botNames = ['Bot1', 'Bot2', 'Bot3'];
+                            for (let i = 0; i < numBots; i++) {
+                                const botId = botNames[i] || `Bot${i + 1}`;
+                                const nextSlot = this.worldState.players.size;
+                                this.worldState.addBot(botId, nextSlot, this.ships[Math.floor(Math.random() * this.ships.length)].id);
+                            }
                         }
-                    }
-                    this.session.start();
-                });
+                        this.session.start();
+                    });
+                } else {
+                    drawScreenText(
+                        remotePlayerIds.length > 0
+                            ? `Waiting for players to ready up (${this.getReadyRemotePlayerCount()}/${remotePlayerIds.length})`
+                            : 'Waiting for players...',
+                        cx,
+                        btnY + 30 * s,
+                        20 * s,
+                        '#CCC',
+                        'center',
+                        'middle'
+                    );
+                }
             } else {
-                drawScreenText('Waiting for Host to start...', cx, btnY + 30 * s, 20 * s, '#CCC', 'center', 'middle');
+                const readyLabel = this.isLocalReady() ? 'NOT READY' : 'READY';
+                const readyColor = this.isLocalReady() ? CONFIG.UI.COLORS.DANGER : CONFIG.UI.COLORS.SUCCESS;
+                draw3DButton(cx - btnW / 2, btnY, btnW, btnH, readyLabel, readyColor, false, this._hovered?.id === 'ready');
+                regBtn(cx - btnW / 2, btnY, btnW, btnH, 'ready', () => this.toggleReady());
             }
         }
 
