@@ -2,7 +2,7 @@
  * config.js — Game configuration for Sky Armada.
  */
 
-window.VERSION = '0.8';
+window.VERSION = '0.9';
 
 export const CONFIG = {
     // ── Identity ────────────────────────────────────────────────────────────

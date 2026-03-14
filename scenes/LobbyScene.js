@@ -34,6 +34,7 @@ export class LobbyScene {
         this.connectionStatus = 'Connecting...';
         this.playerList = [];
         this.localSelectedShip = 'cobro';
+        this.selectedShips = new Map();
         this.ships = CONFIG.SHIPS;
         this.shipIndex = this.ships.findIndex(s => s.id === 'cobro') || 0;
     }
@@ -106,6 +107,7 @@ export class LobbyScene {
                 this.peerId = id;
                 this.worldState.setLocalPlayerId(id);
                 this.worldState.addPlayer(id, 0); // Slot 0
+                this.selectedShips.set(id, this.localSelectedShip);
                 this.worldState.setPlayerShip(id, this.localSelectedShip);
 
                 this.transport = new PeerJSTransport(id);
@@ -215,12 +217,14 @@ export class LobbyScene {
     setupTransportListeners() {
         this.transport.onCustomData = (sender, data) => {
             if (data.type === 'shipSelect') {
+                this.selectedShips.set(data.peerId, data.shipId);
                 this.worldState.setPlayerShip(data.peerId, data.shipId);
                 if (this.isHost) {
                     this.broadcastShip(data.peerId, data.shipId);
                 }
             } else if (data.type === 'initialShips') {
                 for (const [pId, sId] of Object.entries(data.ships)) {
+                    this.selectedShips.set(pId, sId);
                     if (!this.worldState.players.has(pId)) {
                         this.worldState.addPlayer(pId, this.worldState.players.size);
                     }
@@ -228,8 +232,9 @@ export class LobbyScene {
                 }
 
                 // Ensure the client re-applies their chosen ship
-                const myId = this.peer ? this.peer.id : (this.session ? this.session.localPlayerId : null);
+                const myId = this.getLocalPeerId();
                 if (myId) {
+                    this.selectedShips.set(myId, this.localSelectedShip);
                     this.worldState.setPlayerShip(myId, this.localSelectedShip);
                     this.broadcastShip(myId, this.localSelectedShip);
                 }
@@ -237,13 +242,40 @@ export class LobbyScene {
         };
     }
 
+    getLocalPeerId() {
+        return this.peer?.id || this.session?.localPlayerId || this.peerId || null;
+    }
+
+    getHostPeerId() {
+        if (this.isHost) {
+            return this.getLocalPeerId();
+        }
+
+        const hostPlayer = this.session
+            ? Array.from(this.session.players.values()).find(player => player.isHost)
+            : null;
+        if (hostPlayer?.id) {
+            return hostPlayer.id;
+        }
+
+        const connectedPeers = this.transport?.connectedPeers;
+        if (connectedPeers?.size) {
+            return connectedPeers.values().next().value;
+        }
+
+        return null;
+    }
+
     broadcastShip(peerId, shipId) {
         if (!this.transport) return;
         const msg = { __customData: true, type: 'shipSelect', peerId, shipId };
         if (this.isHost) {
-            this.transport.broadcast(msg);
-        } else if (this.session && this.session.roomId) {
-            this.transport.send(this.session.roomId, msg, true);
+            this.transport.broadcast(msg, true);
+        } else {
+            const hostPeerId = this.getHostPeerId();
+            if (hostPeerId) {
+                this.transport.send(hostPeerId, msg, true);
+            }
         }
     }
 
@@ -251,8 +283,9 @@ export class LobbyScene {
         this.shipIndex = (this.shipIndex + direction + this.ships.length) % this.ships.length;
         this.localSelectedShip = this.ships[this.shipIndex].id;
 
-        const myId = this.peer ? this.peer.id : (this.session ? this.session.localPlayerId : null);
+        const myId = this.getLocalPeerId();
         if (myId) {
+            this.selectedShips.set(myId, this.localSelectedShip);
             this.worldState.setPlayerShip(myId, this.localSelectedShip);
             this.broadcastShip(myId, this.localSelectedShip);
         }
@@ -262,27 +295,30 @@ export class LobbyScene {
         this.session.on('playerJoined', (player) => {
             if (!this.worldState.players.has(player.id)) {
                 this.worldState.addPlayer(player.id, this.worldState.players.size);
-                this.worldState.setPlayerShip(player.id, 'cobro');
             }
+            const selectedShip = this.selectedShips.get(player.id) || 'cobro';
+            this.selectedShips.set(player.id, selectedShip);
+            this.worldState.setPlayerShip(player.id, selectedShip);
 
             // Broadcast and coordinate if host
             if (this.isHost) {
 
                 const shipMap = {};
                 for (const [id, p] of this.worldState.players) {
-                    shipMap[id] = p.shipId;
+                    shipMap[id] = this.selectedShips.get(id) || p.shipId;
                 }
                 // Small delay to ensure the client is ready to receive
                 setTimeout(() => {
                     this.transport.send(player.id, { __customData: true, type: 'initialShips', ships: shipMap }, true);
                 }, 100);
 
-                this.broadcastShip(player.id, 'cobro');
+                this.broadcastShip(player.id, selectedShip);
             }
         });
 
         this.session.on('playerLeft', (player) => {
             this.worldState.removePlayer(player.id);
+            this.selectedShips.delete(player.id);
             if (player.isHost && !this.isHost) {
                 this.disconnect('Host disconnected from the session.');
             }
@@ -526,6 +562,12 @@ export class LobbyScene {
             if (this.isHost) {
                 draw3DButton(cx - btnW / 2, btnY, btnW, btnH, 'START MATCH', CONFIG.UI.COLORS.GOLD, false, this._hovered?.id === 'start');
                 regBtn(cx - btnW / 2, btnY, btnW, btnH, 'start', () => {
+                    for (const [id] of this.worldState.players) {
+                        const shipId = this.selectedShips.get(id);
+                        if (shipId) {
+                            this.worldState.setPlayerShip(id, shipId);
+                        }
+                    }
                     if (this.session.players.size <= 1) {
                         const numBots = CONFIG.COMBAT.BOT_COUNT;
                         const botNames = ['Bot1', 'Bot2', 'Bot3'];
