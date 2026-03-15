@@ -114,6 +114,7 @@ export class WorldState {
         this.cloudCover.enabled = !!this.cloudCover.enabled;
         this.cloudCover.visionRadius = Math.fround(Math.max(0, this.cloudCover.visionRadius || 0));
         this.cloudCover.affectsMinimap = !!this.cloudCover.affectsMinimap;
+        this.cloudCover.forceMinSpeed = !!this.cloudCover.forceMinSpeed;
         this.cloudCover.zones = normalizeCloudZones(this.cloudCover.zones);
 
         this.dangerBorder.initialInset = Math.fround(this.dangerBorder.initialInset || 0);
@@ -246,6 +247,7 @@ export class WorldState {
             enabled: !!config.ENABLED,
             visionRadius: Math.fround(Math.max(0, Number(config.VISION_RADIUS) || 0)),
             affectsMinimap: !!config.AFFECTS_MINIMAP,
+            forceMinSpeed: !!config.FORCE_MIN_SPEED,
             zones: normalizeCloudZones(Array.isArray(map.cloudCoverZones) ? map.cloudCoverZones : []),
         };
     }
@@ -449,6 +451,11 @@ export class WorldState {
         return this.getPlayerCloudZone(playerOrId)?.id || null;
     }
 
+    isPlayerSpeedLockedByCloud(playerOrId) {
+        if (!this.cloudCover?.enabled || !this.cloudCover?.forceMinSpeed) return false;
+        return !!this.getPlayerCloudZone(playerOrId);
+    }
+
     getObserverCloudState(observerId) {
         const observer = this.players.get(observerId);
         const zone = observer ? this.getPlayerCloudZone(observer) : null;
@@ -459,6 +466,8 @@ export class WorldState {
             zone,
             visionRadius: this.cloudCover?.visionRadius || 0,
             affectsMinimap: !!this.cloudCover?.affectsMinimap,
+            forceMinSpeed: !!this.cloudCover?.forceMinSpeed,
+            speedLocked: !!zone && !!this.cloudCover?.forceMinSpeed,
         };
     }
 
@@ -1008,7 +1017,7 @@ export class WorldState {
         const cloudZones = this.getSortedCloudZones();
         const count = playerEntries.length;
         const encoder = new TextEncoder();
-        let bufferSize = 216 + (this.debris.length * 34) + (this.powerups.length * 20);
+        let bufferSize = 220 + (this.debris.length * 34) + (this.powerups.length * 20);
         const idBytesList = [];
         const cloudZoneIdBytesList = [];
 
@@ -1075,6 +1084,7 @@ export class WorldState {
         view.setUint32(offset, this.cloudCover.enabled ? 1 : 0, true); offset += 4;
         view.setFloat32(offset, this.cloudCover.visionRadius, true); offset += 4;
         view.setUint32(offset, this.cloudCover.affectsMinimap ? 1 : 0, true); offset += 4;
+        view.setUint32(offset, this.cloudCover.forceMinSpeed ? 1 : 0, true); offset += 4;
         view.setUint32(offset, cloudZones.length, true); offset += 4;
 
         for (let i = 0; i < cloudZones.length; i++) {
@@ -1215,10 +1225,11 @@ export class WorldState {
             enabled: view.getUint32(offset, true) === 1,
             visionRadius: view.getFloat32(offset + 4, true),
             affectsMinimap: view.getUint32(offset + 8, true) === 1,
+            forceMinSpeed: view.getUint32(offset + 12, true) === 1,
             zones: [],
         };
-        const cloudZoneCount = view.getUint32(offset + 12, true);
-        offset += 16;
+        const cloudZoneCount = view.getUint32(offset + 16, true);
+        offset += 20;
 
         for (let i = 0; i < cloudZoneCount; i++) {
             const idLen = view.getUint8(offset); offset += 1;
@@ -1494,15 +1505,21 @@ export class WorldState {
             }
 
             const last = this.lastInput.get(id) || 0;
+            const speedLockedByCloud = this.isPlayerSpeedLockedByCloud(pdata);
+
+            // Cloud cover can deterministically pin throttle to the minimum tier.
+            const def = ShipDefinitions.get(pdata.shipId);
+            if (speedLockedByCloud) {
+                pdata.speedTier = 1;
+            }
 
             // Speed controls
-            const def = ShipDefinitions.get(pdata.shipId);
-            if ((flags & 0x04) && !(last & 0x04)) {
+            if (!speedLockedByCloud && (flags & 0x04) && !(last & 0x04)) {
                 if ((pdata.slowTimer || 0) <= 0) {
                     pdata.speedTier = Math.min(def.speedTierValues.length, pdata.speedTier + 1);
                 }
             }
-            if ((flags & 0x08) && !(last & 0x08)) {
+            if (!speedLockedByCloud && (flags & 0x08) && !(last & 0x08)) {
                 pdata.speedTier = Math.max(1, pdata.speedTier - 1);
             }
 
@@ -1519,6 +1536,10 @@ export class WorldState {
 
             ship.step(flags, dt);
             Object.assign(pdata, ship.toState());
+
+            if (this.isPlayerSpeedLockedByCloud(pdata)) {
+                pdata.speedTier = 1;
+            }
 
             if (pdata.invincibilityTimer > 0) {
                 pdata.invincibilityTimer = Math.max(0, pdata.invincibilityTimer - dt);

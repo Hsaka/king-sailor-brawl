@@ -141,6 +141,7 @@ function createCloudCoverConfig(overrides = {}) {
         VISION_RADIUS: 120,
         EDGE_FADE: 48,
         AFFECTS_MINIMAP: true,
+        FORCE_MIN_SPEED: true,
         DEBUG_RENDER: false,
         ...overrides,
     };
@@ -527,6 +528,12 @@ test('cloud cover authoritative config is serialized, hashed, and round-trips cl
     });
     assert.notEqual(minimapChanged.hash(minimapChanged.serialize()), baselineHash, 'minimap concealment changes must affect hash');
 
+    const forceMinSpeedChanged = createCombatWorld({
+        arenaConfig: createArenaConfig(),
+        cloudCoverConfig: createCloudCoverConfig({ VISION_RADIUS: 140, AFFECTS_MINIMAP: true, FORCE_MIN_SPEED: false }),
+    });
+    assert.notEqual(forceMinSpeedChanged.hash(forceMinSpeedChanged.serialize()), baselineHash, 'cloud speed lock changes must affect hash');
+
     const zoneChanged = createCombatWorld({
         arenaConfig: createArenaConfig({
             cloudCoverZones: [
@@ -543,6 +550,7 @@ test('cloud cover authoritative config is serialized, hashed, and round-trips cl
     const roundTripBytes = roundTrip.serialize();
     assertStateBytesEqual(roundTripBytes, baselineBytes, 'cloud cover state should round-trip byte-for-byte');
     assert.equal(roundTrip.hash(roundTripBytes), baselineHash, 'round-tripped cloud cover state should hash identically');
+    assert.equal(roundTrip.cloudCover.forceMinSpeed, baseline.cloudCover.forceMinSpeed, 'round-tripped cloud speed lock should survive serialization');
 });
 
 test('cloud cover respects configured vision radius and ignores render-only config in authoritative state', () => {
@@ -577,6 +585,69 @@ test('cloud cover respects configured vision radius and ignores render-only conf
     const renderOnlyBytesB = renderOnlyB.serialize();
     assertStateBytesEqual(renderOnlyBytesA, renderOnlyBytesB, 'render-only cloud config must not affect authoritative bytes');
     assert.equal(renderOnlyA.hash(renderOnlyBytesA), renderOnlyB.hash(renderOnlyBytesB), 'render-only cloud config must not affect authoritative hashes');
+});
+
+test('cloud cover can clamp ships to minimum speed tier while inside', () => {
+    const arenaConfig = createArenaConfig({
+        cloudCoverZones: [
+            { id: 'cloud_alpha', x: 1000, y: 1000, radius: 160 },
+        ],
+    });
+    const lockedWorld = createCombatWorld({
+        arenaConfig,
+        cloudCoverConfig: createCloudCoverConfig({ FORCE_MIN_SPEED: true }),
+    });
+
+    setPlayerState(lockedWorld, 'p1', { x: 980, y: 1000, heading: 0, speedTier: 3 });
+    setPlayerState(lockedWorld, 'p2', { x: 2000, y: 2000, heading: 180, speedTier: 1 });
+    lockedWorld.lastInput.set('p1', 0);
+    lockedWorld.lastInput.set('p2', 0);
+    lockedWorld.quantizeState();
+
+    lockedWorld.step(new Map([
+        ['p1', packInput(0x04)],
+        ['p2', packInput(0)],
+    ]));
+    assert.equal(lockedWorld.players.get('p1').speedTier, 1, 'ships already inside cloud should immediately drop to the minimum speed tier');
+
+    lockedWorld.step(new Map([
+        ['p1', packInput(0)],
+        ['p2', packInput(0)],
+    ]));
+    lockedWorld.step(new Map([
+        ['p1', packInput(0x04)],
+        ['p2', packInput(0)],
+    ]));
+    assert.equal(lockedWorld.players.get('p1').speedTier, 1, 'speed changes should be ignored while the ship remains inside cloud cover');
+    assert.equal(lockedWorld.isPlayerSpeedLockedByCloud('p1'), true, 'authoritative cloud speed lock should stay derived from current cloud membership');
+
+    setPlayerState(lockedWorld, 'p1', { x: 1400, y: 1000, heading: 0, speedTier: 1 });
+    lockedWorld.lastInput.set('p1', 0);
+    lockedWorld.quantizeState();
+
+    lockedWorld.step(new Map([
+        ['p1', packInput(0x04)],
+        ['p2', packInput(0)],
+    ]));
+    assert.equal(lockedWorld.players.get('p1').speedTier, 2, 'ships should regain throttle control after leaving the cloud');
+    assert.equal(lockedWorld.isPlayerSpeedLockedByCloud('p1'), false, 'speed lock should clear once the ship exits cloud cover');
+
+    const unlockedWorld = createCombatWorld({
+        arenaConfig,
+        cloudCoverConfig: createCloudCoverConfig({ FORCE_MIN_SPEED: false }),
+    });
+    setPlayerState(unlockedWorld, 'p1', { x: 980, y: 1000, heading: 0, speedTier: 2 });
+    setPlayerState(unlockedWorld, 'p2', { x: 2000, y: 2000, heading: 180, speedTier: 1 });
+    unlockedWorld.lastInput.set('p1', 0);
+    unlockedWorld.lastInput.set('p2', 0);
+    unlockedWorld.quantizeState();
+
+    unlockedWorld.step(new Map([
+        ['p1', packInput(0x04)],
+        ['p2', packInput(0)],
+    ]));
+    assert.equal(unlockedWorld.players.get('p1').speedTier, 3, 'disabling the toggle should leave in-cloud throttle changes untouched');
+    assert.equal(unlockedWorld.isPlayerSpeedLockedByCloud('p1'), false, 'disabled cloud speed lock should not report authoritative throttle suppression');
 });
 
 test('two peers remain byte-identical under the same scripted simulation', () => {
@@ -884,6 +955,80 @@ test('rollback convergence includes delayed cloud entry and exit', () => {
         authoritativeWorld.getPlayerVisibilityState('p1', 'p2'),
         'derived cloud visibility should match after rollback convergence',
     );
+});
+
+test('rollback convergence includes delayed cloud speed locking', () => {
+    const arenaConfig = createArenaConfig({
+        cloudCoverZones: [
+            { id: 'cloud_alpha', x: 1000, y: 1000, radius: 80 },
+        ],
+    });
+    const cloudCoverConfig = createCloudCoverConfig({ VISION_RADIUS: 110, FORCE_MIN_SPEED: true });
+    const authoritativeWorld = createRollbackWorld({ arenaConfig, cloudCoverConfig });
+    const predictedWorld = createRollbackWorld({ arenaConfig, cloudCoverConfig });
+
+    setPlayerState(authoritativeWorld, 'p1', { x: 400, y: 400, heading: 0, speedTier: 1 });
+    setPlayerState(authoritativeWorld, 'p2', { x: 880, y: 1000, heading: 0, speedTier: 2 });
+    setPlayerState(predictedWorld, 'p1', { x: 400, y: 400, heading: 0, speedTier: 1 });
+    setPlayerState(predictedWorld, 'p2', { x: 880, y: 1000, heading: 0, speedTier: 2 });
+
+    const authoritative = createEngine(authoritativeWorld);
+    const predicted = createEngine(predictedWorld);
+    const remoteInputs = [];
+    const delayTicks = 4;
+    const totalTicks = 96;
+    let sawRollback = false;
+    let sawCloudEntry = false;
+    let sawCloudExit = false;
+    let sawSpeedClamp = false;
+
+    for (let tick = 0; tick < totalTicks; tick++) {
+        const localInput = packInput(0);
+        const remoteInput = packInput(tick === 0 ? 0x04 : 0);
+        remoteInputs.push(remoteInput);
+
+        authoritative.setLocalInput(tick, localInput);
+        authoritative.receiveRemoteInput('p2', tick, remoteInput);
+        authoritative.tick();
+
+        const zoneId = authoritativeWorld.getPlayerCloudZoneId('p2');
+        sawCloudEntry ||= zoneId === 'cloud_alpha';
+        sawCloudExit ||= sawCloudEntry && zoneId === null;
+        sawSpeedClamp ||= zoneId === 'cloud_alpha' && authoritativeWorld.players.get('p2').speedTier === 1;
+
+        predicted.setLocalInput(tick, localInput);
+        if (tick >= delayTicks) {
+            predicted.receiveRemoteInput('p2', tick - delayTicks, remoteInputs[tick - delayTicks]);
+        }
+
+        const result = predicted.tick();
+        sawRollback ||= !!result?.rolledBack;
+    }
+
+    for (let tick = totalTicks - delayTicks; tick < totalTicks; tick++) {
+        predicted.receiveRemoteInput('p2', tick, remoteInputs[tick]);
+    }
+
+    for (let i = 0; i < delayTicks; i++) {
+        const tick = totalTicks + i;
+        const idleInput = packInput(0);
+        authoritative.setLocalInput(tick, idleInput);
+        authoritative.receiveRemoteInput('p2', tick, idleInput);
+        authoritative.tick();
+
+        predicted.setLocalInput(tick, idleInput);
+        predicted.receiveRemoteInput('p2', tick, idleInput);
+        const result = predicted.tick();
+        sawRollback ||= !!result?.rolledBack;
+    }
+
+    assert.ok(sawCloudEntry, 'authoritative remote ship should enter the cloud during the scripted path');
+    assert.ok(sawCloudExit, 'authoritative remote ship should exit the cloud during the scripted path');
+    assert.ok(sawSpeedClamp, 'cloud membership should authoritatively clamp remote throttle to the minimum tier');
+    assert.ok(sawRollback, 'late remote throttle input should trigger rollback when cloud speed locking changes the path');
+    assertStateBytesEqual(predicted.getState().state, authoritative.getState().state, 'cloud speed lock rollback should converge to the same authoritative bytes');
+    assert.equal(predicted.getCurrentHash(), authoritative.getCurrentHash(), 'cloud speed lock rollback should converge to the same hash');
+    assert.equal(predictedWorld.players.get('p2').speedTier, authoritativeWorld.players.get('p2').speedTier, 'remote speed tier should match after rollback convergence');
 });
 
 test('power-up effects expire on deterministic tick boundaries', () => {

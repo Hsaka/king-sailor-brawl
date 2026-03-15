@@ -235,9 +235,9 @@ export class HUD {
         const observer = worldState?.getObserverCloudState?.(observerId);
         if (!observer?.insideCloud) return;
 
-        const label = 'CLOUD COVER';
+        const label = observer.speedLocked ? 'CLOUD COVER - MIN SPEED' : 'CLOUD COVER';
         const padX = 14 * s;
-        const badgeW = 132 * s;
+        const badgeW = observer.speedLocked ? 214 * s : 132 * s;
         const badgeH = 30 * s;
         const x = centerX - (badgeW / 2);
 

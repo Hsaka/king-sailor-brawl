@@ -125,6 +125,8 @@ export const CONFIG = {
         VISION_RADIUS: 180,
         EDGE_FADE: 48,
         AFFECTS_MINIMAP: true,
+        // Clamp ships inside clouds to speed tier 1 until they exit.
+        FORCE_MIN_SPEED: true,
         DEBUG_RENDER: false,
     },
 

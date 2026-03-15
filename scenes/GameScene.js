@@ -434,6 +434,8 @@ export class GameScene {
                 observerId,
                 zoneId,
                 insideCloud: observerState.insideCloud,
+                forceMinSpeed: observerState.forceMinSpeed,
+                speedLocked: observerState.speedLocked,
             });
             this.cloudDebug.zoneId = zoneId;
         }
@@ -517,6 +519,7 @@ export class GameScene {
         const cloudEnabledChanged = !!remoteCloudCover.enabled !== !!localCloudCover.enabled;
         const cloudVisionRadiusDiff = Math.abs((remoteCloudCover.visionRadius || 0) - (localCloudCover.visionRadius || 0));
         const cloudMinimapChanged = !!remoteCloudCover.affectsMinimap !== !!localCloudCover.affectsMinimap;
+        const cloudForceMinSpeedChanged = !!remoteCloudCover.forceMinSpeed !== !!localCloudCover.forceMinSpeed;
         const powerupEnabledChanged = !!remotePowerupConfig.enabled !== !!localPowerupConfig.enabled;
         const powerupSpawnEnabledChanged = !!remotePowerupConfig.spawnEnabled !== !!localPowerupConfig.spawnEnabled;
         const powerupMaxActiveDiff = Math.abs((remotePowerupConfig.maxActive || 0) - (localPowerupConfig.maxActive || 0));
@@ -542,6 +545,7 @@ export class GameScene {
         if (cloudEnabledChanged) bump(fieldCounts, 'cloudCover_enabled');
         if (cloudVisionRadiusDiff > 0.01) bump(fieldCounts, 'cloudCover_visionRadius');
         if (cloudMinimapChanged) bump(fieldCounts, 'cloudCover_affectsMinimap');
+        if (cloudForceMinSpeedChanged) bump(fieldCounts, 'cloudCover_forceMinSpeed');
         if (powerupEnabledChanged) bump(fieldCounts, 'powerups_enabled');
         if (powerupSpawnEnabledChanged) bump(fieldCounts, 'powerups_spawnEnabled');
         if (powerupMaxActiveDiff > 0) bump(fieldCounts, 'powerups_maxActive');
@@ -787,6 +791,8 @@ export class GameScene {
                 remoteEnabled: !!remoteCloudCover.enabled,
                 localVisionRadius: Number((localCloudCover.visionRadius || 0).toFixed(3)),
                 remoteVisionRadius: Number((remoteCloudCover.visionRadius || 0).toFixed(3)),
+                localForceMinSpeed: !!localCloudCover.forceMinSpeed,
+                remoteForceMinSpeed: !!remoteCloudCover.forceMinSpeed,
                 localZoneCount: localCloudZones.length,
                 remoteZoneCount: remoteCloudZones.length,
                 zoneIdDiffCount: cloudZoneIdDiffCount,
