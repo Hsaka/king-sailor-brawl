@@ -115,6 +115,37 @@ function createPowerupConfig(overrides = {}) {
     };
 }
 
+function createArenaConfig(overrides = {}) {
+    const baseZones = [
+        { id: 'cloud_alpha', x: 1000, y: 1000, radius: 180 },
+        { id: 'cloud_beta', x: 1600, y: 1000, radius: 160 },
+    ];
+    const rawZones = overrides.cloudCoverZones || baseZones;
+
+    return {
+        id: 'test_clouds',
+        name: 'Test Clouds',
+        width: 2400,
+        height: 2400,
+        deathZoneDepth: 120,
+        deathZoneDamage: 15,
+        spawnPoints: [],
+        ...overrides,
+        cloudCoverZones: rawZones.map((zone) => ({ ...zone })),
+    };
+}
+
+function createCloudCoverConfig(overrides = {}) {
+    return {
+        ENABLED: true,
+        VISION_RADIUS: 120,
+        EDGE_FADE: 48,
+        AFFECTS_MINIMAP: true,
+        DEBUG_RENDER: false,
+        ...overrides,
+    };
+}
+
 function createCombatWorld(options = {}) {
     const world = new WorldState(options);
     world.seed = 424242;
@@ -432,6 +463,122 @@ test('world state hash covers the full serialized state and round-trips cleanly'
     assert.equal(roundTrip.hash(roundTripBytes), baselineHash, 'round-tripped state should hash identically');
 });
 
+test('cloud cover membership and concealment rules stay deterministic', () => {
+    const world = createCombatWorld({
+        arenaConfig: createArenaConfig(),
+        cloudCoverConfig: createCloudCoverConfig({ VISION_RADIUS: 120 }),
+    });
+    world.addPlayer('p3', 2);
+    world.addPlayer('p4', 3);
+    world.setPlayerShip('p3', 'cobro');
+    world.setPlayerShip('p4', 'cobro');
+
+    setPlayerState(world, 'p1', { x: 930, y: 1000, heading: 0, speedTier: 1 });
+    setPlayerState(world, 'p2', { x: 1010, y: 1000, heading: 180, speedTier: 1 });
+    setPlayerState(world, 'p3', { x: 1160, y: 1000, heading: 180, speedTier: 1 });
+    setPlayerState(world, 'p4', { x: 1600, y: 1000, heading: 180, speedTier: 1 });
+    world.quantizeState();
+
+    assert.equal(world.getPlayerCloudZoneId('p1'), 'cloud_alpha');
+    assert.equal(world.getPlayerCloudZoneId('p2'), 'cloud_alpha');
+    assert.equal(world.getPlayerCloudZoneId('p3'), 'cloud_alpha');
+    assert.equal(world.getPlayerCloudZoneId('p4'), 'cloud_beta');
+
+    let visibility = world.getPlayerVisibilityState('p1', 'p2');
+    assert.equal(visibility.visible, true, 'ships within the same in-cloud vision bubble should be visible');
+    assert.equal(visibility.reason, 'same_cloud_visible');
+
+    visibility = world.getPlayerVisibilityState('p1', 'p3');
+    assert.equal(visibility.visible, false, 'ships in the same cloud but outside the local bubble should be hidden');
+    assert.equal(visibility.reason, 'same_cloud_hidden');
+
+    visibility = world.getPlayerVisibilityState('p1', 'p4');
+    assert.equal(visibility.visible, false, 'ships in a different cloud should stay hidden');
+    assert.equal(visibility.reason, 'hidden_in_other_cloud');
+    assert.equal(world.canObserverSeePoint('p1', 1300, 1300), true, 'points outside all clouds remain visible from inside a cloud');
+
+    setPlayerState(world, 'p1', { x: 500, y: 500, heading: 0, speedTier: 1 });
+    world.quantizeState();
+
+    visibility = world.getPlayerVisibilityState('p1', 'p2');
+    assert.equal(visibility.visible, false, 'ships inside a cloud should be hidden from open air observers');
+    assert.equal(visibility.reason, 'hidden_from_open_air');
+});
+
+test('cloud cover authoritative config is serialized, hashed, and round-trips cleanly', () => {
+    const baseline = createCombatWorld({
+        arenaConfig: createArenaConfig(),
+        cloudCoverConfig: createCloudCoverConfig({ VISION_RADIUS: 140, AFFECTS_MINIMAP: true }),
+    });
+    baseline.quantizeState();
+
+    const baselineBytes = baseline.serialize();
+    const baselineHash = baseline.hash(baselineBytes);
+
+    const radiusChanged = createCombatWorld({
+        arenaConfig: createArenaConfig(),
+        cloudCoverConfig: createCloudCoverConfig({ VISION_RADIUS: 180, AFFECTS_MINIMAP: true }),
+    });
+    assert.notEqual(radiusChanged.hash(radiusChanged.serialize()), baselineHash, 'vision radius changes must affect hash');
+
+    const minimapChanged = createCombatWorld({
+        arenaConfig: createArenaConfig(),
+        cloudCoverConfig: createCloudCoverConfig({ VISION_RADIUS: 140, AFFECTS_MINIMAP: false }),
+    });
+    assert.notEqual(minimapChanged.hash(minimapChanged.serialize()), baselineHash, 'minimap concealment changes must affect hash');
+
+    const zoneChanged = createCombatWorld({
+        arenaConfig: createArenaConfig({
+            cloudCoverZones: [
+                { id: 'cloud_alpha', x: 1000, y: 1000, radius: 210 },
+                { id: 'cloud_beta', x: 1600, y: 1000, radius: 160 },
+            ],
+        }),
+        cloudCoverConfig: createCloudCoverConfig({ VISION_RADIUS: 140, AFFECTS_MINIMAP: true }),
+    });
+    assert.notEqual(zoneChanged.hash(zoneChanged.serialize()), baselineHash, 'cloud zone layout changes must affect hash');
+
+    const roundTrip = new WorldState();
+    roundTrip.deserialize(baselineBytes);
+    const roundTripBytes = roundTrip.serialize();
+    assertStateBytesEqual(roundTripBytes, baselineBytes, 'cloud cover state should round-trip byte-for-byte');
+    assert.equal(roundTrip.hash(roundTripBytes), baselineHash, 'round-tripped cloud cover state should hash identically');
+});
+
+test('cloud cover respects configured vision radius and ignores render-only config in authoritative state', () => {
+    const arenaConfig = createArenaConfig();
+    const narrowVision = createCombatWorld({
+        arenaConfig,
+        cloudCoverConfig: createCloudCoverConfig({ VISION_RADIUS: 80, EDGE_FADE: 24, DEBUG_RENDER: false }),
+    });
+    const wideVision = createCombatWorld({
+        arenaConfig,
+        cloudCoverConfig: createCloudCoverConfig({ VISION_RADIUS: 160, EDGE_FADE: 96, DEBUG_RENDER: true }),
+    });
+    const renderOnlyA = createCombatWorld({
+        arenaConfig,
+        cloudCoverConfig: createCloudCoverConfig({ VISION_RADIUS: 120, EDGE_FADE: 24, DEBUG_RENDER: false }),
+    });
+    const renderOnlyB = createCombatWorld({
+        arenaConfig,
+        cloudCoverConfig: createCloudCoverConfig({ VISION_RADIUS: 120, EDGE_FADE: 96, DEBUG_RENDER: true }),
+    });
+
+    for (const world of [narrowVision, wideVision, renderOnlyA, renderOnlyB]) {
+        setPlayerState(world, 'p1', { x: 930, y: 1000, heading: 0, speedTier: 1 });
+        setPlayerState(world, 'p2', { x: 1050, y: 1000, heading: 180, speedTier: 1 });
+        world.quantizeState();
+    }
+
+    assert.equal(narrowVision.getPlayerVisibilityState('p1', 'p2').visible, false, 'narrow vision should hide same-cloud ships outside the configured bubble');
+    assert.equal(wideVision.getPlayerVisibilityState('p1', 'p2').visible, true, 'wider vision should reveal the same target with the same authoritative positions');
+
+    const renderOnlyBytesA = renderOnlyA.serialize();
+    const renderOnlyBytesB = renderOnlyB.serialize();
+    assertStateBytesEqual(renderOnlyBytesA, renderOnlyBytesB, 'render-only cloud config must not affect authoritative bytes');
+    assert.equal(renderOnlyA.hash(renderOnlyBytesA), renderOnlyB.hash(renderOnlyBytesB), 'render-only cloud config must not affect authoritative hashes');
+});
+
 test('two peers remain byte-identical under the same scripted simulation', () => {
     const borderConfig = createDangerBorderConfig({
         MIN_INSET: 320,
@@ -660,6 +807,83 @@ test('rollback convergence includes delayed remote power-up pickups', () => {
     assertStateBytesEqual(predicted.getState().state, authoritative.getState().state, 'pickup rollback should converge to the same authoritative bytes');
     assert.equal(predicted.getCurrentHash(), authoritative.getCurrentHash(), 'pickup rollback should converge to the same hash');
     assert.equal(authoritative.game.players.get('p2').speedBoostTicks, predicted.game.players.get('p2').speedBoostTicks, 'pickup effect timing should converge after rollback');
+});
+
+test('rollback convergence includes delayed cloud entry and exit', () => {
+    const arenaConfig = createArenaConfig({
+        cloudCoverZones: [
+            { id: 'cloud_alpha', x: 1000, y: 1000, radius: 220 },
+        ],
+    });
+    const cloudCoverConfig = createCloudCoverConfig({ VISION_RADIUS: 110, AFFECTS_MINIMAP: true });
+    const authoritativeWorld = createRollbackWorld({ arenaConfig, cloudCoverConfig });
+    const predictedWorld = createRollbackWorld({ arenaConfig, cloudCoverConfig });
+
+    setPlayerState(authoritativeWorld, 'p1', { x: 960, y: 1000, heading: 0, speedTier: 1 });
+    setPlayerState(authoritativeWorld, 'p2', { x: 720, y: 1000, heading: 0, speedTier: 1 });
+    setPlayerState(predictedWorld, 'p1', { x: 960, y: 1000, heading: 0, speedTier: 1 });
+    setPlayerState(predictedWorld, 'p2', { x: 720, y: 1000, heading: 0, speedTier: 1 });
+
+    const authoritative = createEngine(authoritativeWorld);
+    const predicted = createEngine(predictedWorld);
+    const remoteInputs = [];
+    const delayTicks = 5;
+    const totalTicks = 110;
+    let sawRollback = false;
+    let sawCloudEntry = false;
+    let sawCloudExit = false;
+
+    for (let tick = 0; tick < totalTicks; tick++) {
+        const localInput = packInput(0);
+        const remoteFlags = tick >= 30 && tick < 78 ? 0x02 : 0x00;
+        const remoteInput = packInput(remoteFlags);
+        remoteInputs.push(remoteInput);
+
+        authoritative.setLocalInput(tick, localInput);
+        authoritative.receiveRemoteInput('p2', tick, remoteInput);
+        authoritative.tick();
+
+        const zoneId = authoritativeWorld.getPlayerCloudZoneId('p2');
+        sawCloudEntry ||= zoneId === 'cloud_alpha';
+        sawCloudExit ||= sawCloudEntry && zoneId === null;
+
+        predicted.setLocalInput(tick, localInput);
+        if (tick >= delayTicks) {
+            predicted.receiveRemoteInput('p2', tick - delayTicks, remoteInputs[tick - delayTicks]);
+        }
+
+        const result = predicted.tick();
+        sawRollback ||= !!result?.rolledBack;
+    }
+
+    for (let tick = totalTicks - delayTicks; tick < totalTicks; tick++) {
+        predicted.receiveRemoteInput('p2', tick, remoteInputs[tick]);
+    }
+
+    for (let i = 0; i < delayTicks; i++) {
+        const tick = totalTicks + i;
+        const idleInput = packInput(0);
+        authoritative.setLocalInput(tick, idleInput);
+        authoritative.receiveRemoteInput('p2', tick, idleInput);
+        authoritative.tick();
+
+        predicted.setLocalInput(tick, idleInput);
+        predicted.receiveRemoteInput('p2', tick, idleInput);
+        const result = predicted.tick();
+        sawRollback ||= !!result?.rolledBack;
+    }
+
+    assert.ok(sawCloudEntry, 'authoritative remote ship should enter the cloud during the scripted path');
+    assert.ok(sawCloudExit, 'authoritative remote ship should exit the cloud during the scripted path');
+    assert.ok(sawRollback, 'delayed cloud-affecting remote inputs should force at least one rollback');
+    assert.equal(predicted.currentTick, authoritative.currentTick, 'engines should end on the same tick');
+    assertStateBytesEqual(predicted.getState().state, authoritative.getState().state, 'cloud-cover rollback should converge to the same authoritative bytes');
+    assert.equal(predicted.getCurrentHash(), authoritative.getCurrentHash(), 'cloud-cover rollback should converge to the same hash');
+    assert.deepEqual(
+        predictedWorld.getPlayerVisibilityState('p1', 'p2'),
+        authoritativeWorld.getPlayerVisibilityState('p1', 'p2'),
+        'derived cloud visibility should match after rollback convergence',
+    );
 });
 
 test('power-up effects expire on deterministic tick boundaries', () => {

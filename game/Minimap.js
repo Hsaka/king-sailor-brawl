@@ -8,6 +8,9 @@ export class Minimap {
      */
     render(c, s, worldState, localPlayerId, x, y, size) {
         const map = worldState?.getArenaBounds?.() || worldState?.arena || CONFIG.MAPS[0];
+        const cloudCover = worldState?.cloudCover || null;
+        const cloudZones = worldState?.getSortedCloudZones?.() || [];
+        const concealOnMinimap = !!cloudCover?.enabled && !!cloudCover?.affectsMinimap;
         const safeBounds = worldState?.getDangerBorderSafeBounds?.() || {
             left: map.deathZoneDepth,
             top: map.deathZoneDepth,
@@ -48,9 +51,23 @@ export class Minimap {
         c.lineWidth = 1 * s;
         c.strokeRect(0, 0, size, size);
 
+        const zoneScale = Math.min(scaleX, scaleY);
+        for (const zone of cloudZones) {
+            c.fillStyle = 'rgba(255, 255, 255, 0.18)';
+            c.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+            c.lineWidth = Math.max(0.75, 1 * s);
+            c.beginPath();
+            c.arc(zone.x * scaleX, zone.y * scaleY, zone.radius * zoneScale, 0, Math.PI * 2);
+            c.fill();
+            c.stroke();
+        }
+
         // Render Debris
         c.fillStyle = '#A0A0A0';
         for (const d of worldState.debris) {
+            if (concealOnMinimap && !worldState.canObserverSeePoint(localPlayerId, d.x, d.y, { targetRadius: d.radius })) {
+                continue;
+            }
             const dx = d.x * scaleX;
             const dy = d.y * scaleY;
             c.beginPath();
@@ -61,6 +78,7 @@ export class Minimap {
         // Render Ships
         for (const [id, p] of worldState.players) {
             if (!p.alive) continue;
+            if (concealOnMinimap && !worldState.getPlayerVisibilityState(localPlayerId, id).visible) continue;
 
             const px = p.x * scaleX;
             const py = p.y * scaleY;

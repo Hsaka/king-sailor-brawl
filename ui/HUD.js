@@ -55,6 +55,7 @@ export class HUD {
         drawScreenText(`${Math.ceil(localPlayer.health)} / ${def.maxHealth}`, sw / 2, hpY + hpBarH / 2 + 2 * s, 14 * s * 1.5, '#000000ff', 'center', 'middle');
 
         this.drawActivePowerups(c, s, worldState, localPlayer, hpX, hpY + hpBarH + (16 * s));
+        this.drawCloudStatus(c, s, worldState, targetId, sw / 2, hpY + hpBarH + (68 * s));
 
         // Speed indicator
         // const speedText = `SPEED: ${localPlayer.speedTier}`;
@@ -225,5 +226,30 @@ export class HUD {
             drawScreenText(`${remainingSeconds.toFixed(1)}s`, bx + 72 * s, by + (badgeH / 2), 14 * s, '#FFFFFF', 'center', 'middle');
             c.restore();
         }
+    }
+
+    drawCloudStatus(c, s, worldState, observerId, centerX, y) {
+        const cloudCover = worldState?.cloudCover || {};
+        if (!cloudCover.enabled) return;
+
+        const observer = worldState?.getObserverCloudState?.(observerId);
+        if (!observer?.insideCloud) return;
+
+        const label = 'CLOUD COVER';
+        const padX = 14 * s;
+        const badgeW = 132 * s;
+        const badgeH = 30 * s;
+        const x = centerX - (badgeW / 2);
+
+        c.save();
+        c.fillStyle = 'rgba(244, 248, 255, 0.78)';
+        c.strokeStyle = 'rgba(255, 255, 255, 0.95)';
+        c.lineWidth = Math.max(1, 2 * s);
+        c.beginPath();
+        c.roundRect(x, y, badgeW, badgeH, 12 * s);
+        c.fill();
+        c.stroke();
+        drawScreenText(label, x + padX + ((badgeW - (padX * 2)) / 2), y + (badgeH / 2) + (1 * s), 13 * s, '#203040', 'center', 'middle');
+        c.restore();
     }
 }

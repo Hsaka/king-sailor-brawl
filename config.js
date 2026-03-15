@@ -2,7 +2,7 @@
  * config.js — Game configuration for Sky Armada.
  */
 
-window.VERSION = '0.9';
+window.VERSION = '1.1';
 
 export const CONFIG = {
     // ── Identity ────────────────────────────────────────────────────────────
@@ -120,6 +120,14 @@ export const CONFIG = {
         VIGNETTE_ALPHA: 0.6,
     },
 
+    CLOUD_COVER: {
+        ENABLED: true,
+        VISION_RADIUS: 180,
+        EDGE_FADE: 48,
+        AFFECTS_MINIMAP: true,
+        DEBUG_RENDER: false,
+    },
+
     DANGER_BORDER: {
         ENABLED: true,
         START_DELAY_SECONDS: 30,
@@ -213,6 +221,11 @@ export const CONFIG = {
             height: 2400,
             deathZoneDepth: 120,
             deathZoneDamage: 15,
+            cloudCoverZones: [
+                { id: 'cloud_center', x: 1200, y: 1200, radius: 250 },
+                { id: 'cloud_northwest', x: 760, y: 760, radius: 210 },
+                { id: 'cloud_southeast', x: 1640, y: 1640, radius: 210 },
+            ],
             spawnPoints: [
                 { x: 400, y: 400, heading: 45 },
                 { x: 2000, y: 400, heading: 135 },

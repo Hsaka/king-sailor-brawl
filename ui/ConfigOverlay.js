@@ -1,7 +1,7 @@
 import { CONFIG } from '../config.js';
 
 let DEFAULT_CONFIG = null;
-const PERSISTED_TOP_LEVEL = ['MOVEMENT', 'COMBAT', 'DEATH_ZONE', 'DANGER_BORDER', 'MAPS', 'SHIPS', 'POWERUPS'];
+const PERSISTED_TOP_LEVEL = ['MOVEMENT', 'COMBAT', 'DEATH_ZONE', 'DANGER_BORDER', 'MAPS', 'CLOUD_COVER', 'SHIPS', 'POWERUPS'];
 
 export class ConfigOverlay {
     constructor() {

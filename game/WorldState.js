@@ -25,6 +25,41 @@ const SPEED_BOOST_TYPE_ID = getPowerupTypeId('speed_boost');
 const SHIELD_TYPE_ID = getPowerupTypeId('shield');
 const ATTACK_BOOST_TYPE_ID = getPowerupTypeId('attack_boost');
 
+function compareCloudZones(a, b) {
+    return a.id.localeCompare(b.id) ||
+        (a.x - b.x) ||
+        (a.y - b.y) ||
+        (a.radius - b.radius);
+}
+
+function normalizeCloudZones(rawZones = []) {
+    const usedIds = new Set();
+    const zones = [];
+
+    for (let i = 0; i < rawZones.length; i++) {
+        const raw = rawZones[i] || {};
+        const fallbackId = `cloud_${i + 1}`;
+        const baseId = typeof raw.id === 'string' && raw.id.trim()
+            ? raw.id.trim()
+            : fallbackId;
+        const id = usedIds.has(baseId) ? `${baseId}_${i + 1}` : baseId;
+        usedIds.add(id);
+
+        const radius = Math.max(0, Number(raw.radius) || 0);
+        if (radius <= 0) continue;
+
+        zones.push({
+            id,
+            x: Math.fround(Number(raw.x) || 0),
+            y: Math.fround(Number(raw.y) || 0),
+            radius: Math.fround(radius),
+        });
+    }
+
+    zones.sort(compareCloudZones);
+    return zones;
+}
+
 function hashBytesFNV1a(bytes) {
     let hash = FNV_OFFSET_BASIS_32;
     for (let i = 0; i < bytes.length; i++) {
@@ -49,6 +84,7 @@ export class WorldState {
         this.debris = [];
         this.BOMB_TYPES = CONFIG.COMBAT.BOMB_TYPES;
         this.arena = this.createArenaState(options.arenaConfig);
+        this.cloudCover = this.createCloudCoverState(options.cloudCoverConfig, options.arenaConfig);
         this.dangerBorder = this.createDangerBorderState(options.dangerBorderConfig, this.arena);
         this.powerupConfig = this.createPowerupConfigState(options.powerupConfig);
         this.powerups = [];
@@ -70,6 +106,15 @@ export class WorldState {
         this.arena.height = Math.fround(this.arena.height || 0);
         this.arena.deathZoneDepth = Math.fround(this.arena.deathZoneDepth || 0);
         this.arena.deathZoneDamage = Math.fround(this.arena.deathZoneDamage || 0);
+
+        if (!this.cloudCover) {
+            this.cloudCover = this.createCloudCoverState();
+        }
+
+        this.cloudCover.enabled = !!this.cloudCover.enabled;
+        this.cloudCover.visionRadius = Math.fround(Math.max(0, this.cloudCover.visionRadius || 0));
+        this.cloudCover.affectsMinimap = !!this.cloudCover.affectsMinimap;
+        this.cloudCover.zones = normalizeCloudZones(this.cloudCover.zones);
 
         this.dangerBorder.initialInset = Math.fround(this.dangerBorder.initialInset || 0);
         this.dangerBorder.currentInset = Math.fround(this.dangerBorder.currentInset || 0);
@@ -194,6 +239,17 @@ export class WorldState {
         };
     }
 
+    createCloudCoverState(cloudCoverConfig = CONFIG.CLOUD_COVER, mapConfig = CONFIG.MAPS[0]) {
+        const config = cloudCoverConfig || {};
+        const map = mapConfig || {};
+        return {
+            enabled: !!config.ENABLED,
+            visionRadius: Math.fround(Math.max(0, Number(config.VISION_RADIUS) || 0)),
+            affectsMinimap: !!config.AFFECTS_MINIMAP,
+            zones: normalizeCloudZones(Array.isArray(map.cloudCoverZones) ? map.cloudCoverZones : []),
+        };
+    }
+
     createDangerBorderState(borderConfig = CONFIG.DANGER_BORDER, arena = this.arena) {
         const config = borderConfig || {};
         const tickRate = Math.max(1, Number(CONFIG.NETCODE?.TICK_RATE) || 60);
@@ -295,6 +351,11 @@ export class WorldState {
         this.quantizeState();
     }
 
+    setCloudCoverConfig(cloudCoverConfig, mapConfig = CONFIG.MAPS[0]) {
+        this.cloudCover = this.createCloudCoverState(cloudCoverConfig, mapConfig);
+        this.quantizeState();
+    }
+
     setPowerupConfig(powerupConfig) {
         this.powerupConfig = this.createPowerupConfigState(powerupConfig);
         this.powerups = [];
@@ -356,6 +417,148 @@ export class WorldState {
 
     getArenaBounds() {
         return this.arena;
+    }
+
+    getSortedCloudZones() {
+        return [...(this.cloudCover?.zones || [])].sort(compareCloudZones);
+    }
+
+    getCloudZoneForPoint(x, y) {
+        if (!this.cloudCover?.enabled) return null;
+
+        for (const zone of this.getSortedCloudZones()) {
+            const dx = x - zone.x;
+            const dy = y - zone.y;
+            if ((dx * dx) + (dy * dy) <= zone.radius * zone.radius) {
+                return zone;
+            }
+        }
+
+        return null;
+    }
+
+    getPlayerCloudZone(playerOrId) {
+        const player = typeof playerOrId === 'string'
+            ? this.players.get(playerOrId)
+            : playerOrId;
+        if (!player) return null;
+        return this.getCloudZoneForPoint(player.x, player.y);
+    }
+
+    getPlayerCloudZoneId(playerOrId) {
+        return this.getPlayerCloudZone(playerOrId)?.id || null;
+    }
+
+    getObserverCloudState(observerId) {
+        const observer = this.players.get(observerId);
+        const zone = observer ? this.getPlayerCloudZone(observer) : null;
+        return {
+            observerId,
+            insideCloud: !!zone,
+            zoneId: zone?.id || null,
+            zone,
+            visionRadius: this.cloudCover?.visionRadius || 0,
+            affectsMinimap: !!this.cloudCover?.affectsMinimap,
+        };
+    }
+
+    getPointVisibilityState(observerId, x, y, options = {}) {
+        const cloudsEnabled = !!this.cloudCover?.enabled;
+        const observer = this.players.get(observerId);
+        const observerZone = options.observerZone || (observer ? this.getPlayerCloudZone(observer) : null);
+        const targetZone = options.targetZone || this.getCloudZoneForPoint(x, y);
+        const targetRadius = Math.max(0, Number(options.targetRadius) || 0);
+
+        if (!cloudsEnabled) {
+            return {
+                visible: true,
+                reason: 'cloud_cover_disabled',
+                observerZoneId: observerZone?.id || null,
+                targetZoneId: targetZone?.id || null,
+            };
+        }
+
+        if (!targetZone) {
+            return {
+                visible: true,
+                reason: observerZone ? 'outside_cloud_from_inside' : 'open_air',
+                observerZoneId: observerZone?.id || null,
+                targetZoneId: null,
+            };
+        }
+
+        if (!observer) {
+            return {
+                visible: true,
+                reason: 'observer_missing',
+                observerZoneId: null,
+                targetZoneId: targetZone.id,
+            };
+        }
+
+        if (!observerZone) {
+            return {
+                visible: false,
+                reason: 'hidden_from_open_air',
+                observerZoneId: null,
+                targetZoneId: targetZone.id,
+            };
+        }
+
+        if (observerZone.id !== targetZone.id) {
+            return {
+                visible: false,
+                reason: 'hidden_in_other_cloud',
+                observerZoneId: observerZone.id,
+                targetZoneId: targetZone.id,
+            };
+        }
+
+        const visionRadius = Math.max(0, (this.cloudCover?.visionRadius || 0) + targetRadius);
+        const dx = x - observer.x;
+        const dy = y - observer.y;
+        const visible = (dx * dx) + (dy * dy) <= visionRadius * visionRadius;
+        return {
+            visible,
+            reason: visible ? 'same_cloud_visible' : 'same_cloud_hidden',
+            observerZoneId: observerZone.id,
+            targetZoneId: targetZone.id,
+        };
+    }
+
+    getPlayerVisibilityState(observerId, targetId) {
+        const target = this.players.get(targetId);
+        if (!target || !target.alive) {
+            return {
+                visible: false,
+                reason: 'target_inactive',
+                observerZoneId: this.getPlayerCloudZoneId(observerId),
+                targetZoneId: target ? this.getPlayerCloudZoneId(target) : null,
+            };
+        }
+
+        if (observerId === targetId) {
+            const zoneId = this.getPlayerCloudZoneId(targetId);
+            return {
+                visible: true,
+                reason: 'self',
+                observerZoneId: zoneId,
+                targetZoneId: zoneId,
+            };
+        }
+
+        const shipDef = ShipDefinitions.get(target.shipId);
+        return this.getPointVisibilityState(observerId, target.x, target.y, {
+            targetRadius: shipDef?.hitboxRadius || 0,
+        });
+    }
+
+    canObserverSeePoint(observerId, x, y, options = {}) {
+        return this.getPointVisibilityState(observerId, x, y, options).visible;
+    }
+
+    canPlayerObserveTarget(observerId, targetId) {
+        return this.getPlayerVisibilityState(observerId, targetId).visible;
     }
 
     getDangerBorderInset() {
@@ -802,10 +1005,18 @@ export class WorldState {
 
     serialize() {
         const playerEntries = this.getSortedPlayerEntries();
+        const cloudZones = this.getSortedCloudZones();
         const count = playerEntries.length;
-        let bufferSize = 200 + (this.debris.length * 34) + (this.powerups.length * 20);
         const encoder = new TextEncoder();
+        let bufferSize = 216 + (this.debris.length * 34) + (this.powerups.length * 20);
         const idBytesList = [];
+        const cloudZoneIdBytesList = [];
+
+        for (const zone of cloudZones) {
+            const idBytes = encoder.encode(zone.id);
+            cloudZoneIdBytesList.push(idBytes);
+            bufferSize += 1 + idBytes.length + 12;
+        }
 
         for (const [id] of playerEntries) {
             const idb = encoder.encode(id);
@@ -859,6 +1070,21 @@ export class WorldState {
             view.setFloat32(offset, typeConfig.damageMultiplier, true); offset += 4;
             view.setUint32(offset, typeConfig.spawnWeight, true); offset += 4;
             view.setUint32(offset, typeConfig.maxActive, true); offset += 4;
+        }
+
+        view.setUint32(offset, this.cloudCover.enabled ? 1 : 0, true); offset += 4;
+        view.setFloat32(offset, this.cloudCover.visionRadius, true); offset += 4;
+        view.setUint32(offset, this.cloudCover.affectsMinimap ? 1 : 0, true); offset += 4;
+        view.setUint32(offset, cloudZones.length, true); offset += 4;
+
+        for (let i = 0; i < cloudZones.length; i++) {
+            const zone = cloudZones[i];
+            const idBytes = cloudZoneIdBytesList[i];
+            view.setUint8(offset, idBytes.length); offset += 1;
+            uint8View.set(idBytes, offset); offset += idBytes.length;
+            view.setFloat32(offset, zone.x, true); offset += 4;
+            view.setFloat32(offset, zone.y, true); offset += 4;
+            view.setFloat32(offset, zone.radius, true); offset += 4;
         }
 
         for (let i = 0; i < playerEntries.length; i++) {
@@ -983,9 +1209,30 @@ export class WorldState {
             return typeConfig;
         });
 
+        const decoder = new TextDecoder();
+
+        this.cloudCover = {
+            enabled: view.getUint32(offset, true) === 1,
+            visionRadius: view.getFloat32(offset + 4, true),
+            affectsMinimap: view.getUint32(offset + 8, true) === 1,
+            zones: [],
+        };
+        const cloudZoneCount = view.getUint32(offset + 12, true);
+        offset += 16;
+
+        for (let i = 0; i < cloudZoneCount; i++) {
+            const idLen = view.getUint8(offset); offset += 1;
+            const idBytes = uint8View.subarray(offset, offset + idLen);
+            const id = decoder.decode(idBytes); offset += idLen;
+            const x = view.getFloat32(offset, true); offset += 4;
+            const y = view.getFloat32(offset, true); offset += 4;
+            const radius = view.getFloat32(offset, true); offset += 4;
+
+            this.cloudCover.zones.push({ id, x, y, radius });
+        }
+
         this.players.clear();
         this.lastInput.clear();
-        const decoder = new TextDecoder();
 
         for (let i = 0; i < count; i++) {
             const idLen = view.getUint8(offset); offset += 1;
