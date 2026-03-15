@@ -1401,10 +1401,10 @@ export class GameScene {
             }
 
             smooth.alive = pdata.alive;
-
-            if (isLocal && hadRollback && this.wheelControl && !this.wheelControl.active) {
-                this.wheelControl.syncToHeading(pdata.heading);
-            }
+            // Preserve the local wheel target across normal rollback frames.
+            // The target heading is already part of the encoded local input,
+            // so snapping it back to the speculative ship heading here causes
+            // visible wheel-angle resets during online play.
         }
 
         for (const id of this.renderShipState.keys()) {
