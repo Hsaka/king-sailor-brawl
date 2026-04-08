@@ -8,7 +8,7 @@ export const MAX_INPUT_MESSAGE_SIZE = 65536;
 
 export const DEFAULT_PROTOCOL_LIMITS = {
     maxStringLength: 1024,
-    maxPlayerCount: 256,
+    maxPlayerCount: 65535,
     maxStateSize: 1000000,
 };
 
@@ -480,12 +480,19 @@ function encodeJoinAcceptMessage(msg) {
     const configJson = JSON.stringify(msg.config || {});
     const configBytes = textEncoder.encode(configJson);
 
-    let playersSize = 1;
+    if ((msg.config?.maxPlayers ?? 0) > 65535) {
+        throw new EncodeError('Join accept maxPlayers exceeds maximum', 'config.maxPlayers', 65535, msg.config.maxPlayers);
+    }
+    if (msg.players.length > 65535) {
+        throw new EncodeError('Join accept player count exceeds maximum', 'players.length', 65535, msg.players.length);
+    }
+
+    let playersSize = 0;
     for (const p of msg.players) {
         playersSize += 2 + textEncoder.encode(p.id).length + 2 + textEncoder.encode(p.name || '').length;
     }
 
-    const buffer = new Uint8Array(1 + 2 + playerIdBytes.length + 2 + roomIdBytes.length + 2 + 1 + playersSize + 2 + configBytes.length);
+    const buffer = new Uint8Array(1 + 2 + playerIdBytes.length + 2 + roomIdBytes.length + 2 + 2 + 2 + playersSize + 2 + configBytes.length);
     const view = new DataView(buffer.buffer);
 
     let offset = 0;
@@ -494,8 +501,10 @@ function encodeJoinAcceptMessage(msg) {
     offset += writeString(view, offset, msg.roomId);
     view.setUint16(offset, msg.config.tickRate);
     offset += 2;
-    view.setUint8(offset++, msg.config.maxPlayers);
-    view.setUint8(offset++, msg.players.length);
+    view.setUint16(offset, msg.config.maxPlayers);
+    offset += 2;
+    view.setUint16(offset, msg.players.length);
+    offset += 2;
 
     for (const p of msg.players) {
         offset += writeString(view, offset, p.id);
@@ -517,12 +526,14 @@ function decodeJoinAcceptMessage(view, limits) {
     ensureBytes(view, offset, 2, msgType);
     const tickRate = view.getUint16(offset);
     offset += 2;
-    ensureBytes(view, offset, 2, msgType);
-    const maxPlayers = view.getUint8(offset++);
-    const playerCount = view.getUint8(offset++);
+    ensureBytes(view, offset, 4, msgType);
+    const maxPlayers = view.getUint16(offset);
+    offset += 2;
+    const playerCount = view.getUint16(offset);
+    offset += 2;
 
     if (playerCount > limits.maxPlayerCount) {
-        throw new DecodeError(`Player count exceeds maximum of ${limits.maxPlayerCount}`, msgType, offset - 1, limits.maxPlayerCount, playerCount);
+        throw new DecodeError(`Player count exceeds maximum of ${limits.maxPlayerCount}`, msgType, offset - 2, limits.maxPlayerCount, playerCount);
     }
 
     const players = [];

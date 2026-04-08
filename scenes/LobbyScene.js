@@ -1,10 +1,10 @@
-import { mainContext, mainCanvasSize, mouseWasPressed, mousePosScreen, isFullscreen, toggleFullscreen } from '../littlejs.esm.min.js';
+import { mainContext, mainCanvasSize, mouseWasPressed, mousePosScreen, mouseWheel, isFullscreen, toggleFullscreen } from '../littlejs.esm.min.js';
 import { CONFIG } from '../config.js';
 import { game, switchScene } from '../App.js';
 import { drawScreenText, draw3DButton, drawRoundRect, draw3DCard, hexCss } from '../utils/DrawUtils.js';
 import { Animator } from '../utils/Animator.js';
 import { FloatingParticles } from '../utils/FloatingParticles.js';
-import { createSession, PeerJSTransport, SessionState, PlayerConnectionState } from '../netcode/index.js';
+import { createSession, PeerJSTransport, SessionState, PlayerConnectionState, MAX_PLAYERS_LIMIT } from '../netcode/index.js';
 import { WorldState } from '../game/WorldState.js';
 
 let _buttons = [];
@@ -38,6 +38,8 @@ export class LobbyScene {
         this.readyStates = new Map();
         this.ships = CONFIG.SHIPS;
         this.shipIndex = this.ships.findIndex(s => s.id === 'cobro') || 0;
+        this.playerListScroll = 0;
+        this.playerListViewport = null;
     }
 
     buildSessionConfig(playerName) {
@@ -65,6 +67,7 @@ export class LobbyScene {
             debug: false,
             localPlayerName: playerName,
             tickRate: toPosInt(n.TICK_RATE, 60),
+            maxPlayers: toPosInt(n.MAX_PLAYERS, MAX_PLAYERS_LIMIT),
             snapshotHistorySize: toPosInt(n.SNAPSHOT_HISTORY, 120),
             maxSpeculationTicks: toPosInt(n.MAX_SPECULATION_TICKS, 60),
             hashInterval: toPosInt(n.HASH_INTERVAL, 60),
@@ -76,6 +79,7 @@ export class LobbyScene {
             adaptiveInputDelay: typeof n.ADAPTIVE_INPUT_DELAY === 'boolean' ? n.ADAPTIVE_INPUT_DELAY : true,
             adaptiveDelayUpdateInterval: toPosInt(n.ADAPTIVE_DELAY_UPDATE_INTERVAL, 30),
             jitterBufferMs: toNonNegNum(n.JITTER_BUFFER_MS, 8),
+            startupInputHistoryTicks: toPosInt(n.STARTUP_INPUT_HISTORY_TICKS, 64),
         };
     }
 
@@ -308,6 +312,58 @@ export class LobbyScene {
         return remotePlayerIds.length === 0 || remotePlayerIds.every(id => this.isPlayerReady(id));
     }
 
+    getLobbyMaxPlayers() {
+        const maxPlayers = Number(this.session?.config?.maxPlayers ?? CONFIG.NETCODE?.MAX_PLAYERS);
+        return Number.isInteger(maxPlayers) && maxPlayers > 0 ? maxPlayers : null;
+    }
+
+    getPlayerListLayout(cardWidth, cardHeight, rightX, rightY, s) {
+        const viewportX = rightX + 24 * s;
+        const viewportY = rightY + 70 * s;
+        const viewportHeight = Math.max(120 * s, cardHeight - 106 * s);
+        const scrollColumnWidth = 38 * s;
+        const viewportWidth = Math.max(140 * s, cardWidth - 48 * s - scrollColumnWidth);
+        const rowHeight = 54 * s;
+        const rowGap = 10 * s;
+        const rowStep = rowHeight + rowGap;
+        const contentHeight = this.playerList.length > 0
+            ? this.playerList.length * rowStep - rowGap
+            : 0;
+        const maxScroll = Math.max(0, contentHeight - viewportHeight);
+
+        return {
+            viewportX,
+            viewportY,
+            viewportWidth,
+            viewportHeight,
+            rowHeight,
+            rowGap,
+            rowStep,
+            contentHeight,
+            maxScroll,
+            scrollColumnX: viewportX + viewportWidth + 12 * s,
+            scrollColumnWidth: Math.max(20 * s, scrollColumnWidth - 12 * s),
+        };
+    }
+
+    clampPlayerListScroll(maxScroll = this.playerListViewport?.maxScroll ?? 0) {
+        this.playerListScroll = Math.max(0, Math.min(this.playerListScroll, maxScroll));
+    }
+
+    scrollPlayerListBy(delta) {
+        const maxScroll = this.playerListViewport?.maxScroll ?? 0;
+        if (maxScroll <= 0 || !Number.isFinite(delta) || delta === 0) return;
+        this.playerListScroll = Math.max(0, Math.min(this.playerListScroll + delta, maxScroll));
+    }
+
+    isWithinRect(x, y, rect) {
+        return !!rect
+            && x >= rect.x
+            && x <= rect.x + rect.w
+            && y >= rect.y
+            && y <= rect.y + rect.h;
+    }
+
     broadcastShip(peerId, shipId) {
         if (!this.transport) return;
         const msg = { __customData: true, type: 'shipSelect', peerId, shipId };
@@ -433,6 +489,11 @@ export class LobbyScene {
         }
 
         this.updatePlayerList();
+        this.clampPlayerListScroll();
+
+        if (this.playerListViewport && mouseWheel !== 0 && this.isWithinRect(mp.x, mp.y, this.playerListViewport)) {
+            this.scrollPlayerListBy(mouseWheel * this.playerListViewport.rowStep);
+        }
     }
 
     updatePlayerList() {
@@ -471,6 +532,8 @@ export class LobbyScene {
             if (!a.isHost && b.isHost) return 1;
             return a.fullId.localeCompare(b.fullId);
         });
+
+        this.clampPlayerListScroll();
     }
 
     copyPeerId() {
@@ -598,30 +661,149 @@ export class LobbyScene {
         // --- Players Card (Right) ---
         draw3DCard(rightX, rightY, cardWidth, cardHeight);
         drawScreenText('Players', rightX + 24 * s, rightY + 30 * s, 24 * s, '#FFF', 'left', 'middle', 'Arial', true);
-        drawScreenText(`${this.playerList.length} / 4`, rightX + cardWidth - 24 * s, rightY + 30 * s, 20 * s, '#CCC', 'right', 'middle', 'Arial', true);
+        const maxPlayers = this.getLobbyMaxPlayers();
+        const playerCountLabel = maxPlayers && maxPlayers <= 32
+            ? `${this.playerList.length} / ${maxPlayers}`
+            : `${this.playerList.length} connected`;
+        drawScreenText(playerCountLabel, rightX + cardWidth - 24 * s, rightY + 30 * s, 20 * s, '#CCC', 'right', 'middle', 'Arial', true);
 
-        const listY = rightY + 70 * s;
+        const listLayout = this.getPlayerListLayout(cardWidth, cardHeight, rightX, rightY, s);
+        this.playerListViewport = {
+            x: listLayout.viewportX,
+            y: listLayout.viewportY,
+            w: listLayout.viewportWidth,
+            h: listLayout.viewportHeight,
+            rowStep: listLayout.rowStep,
+            maxScroll: listLayout.maxScroll,
+        };
+        this.clampPlayerListScroll(listLayout.maxScroll);
+
+        drawRoundRect(
+            listLayout.viewportX,
+            listLayout.viewportY,
+            listLayout.viewportWidth,
+            listLayout.viewportHeight,
+            16,
+            'rgba(0,0,0,0.14)',
+            'rgba(255,255,255,0.06)',
+            1
+        );
+
+        c.save();
+        c.beginPath();
+        c.roundRect(listLayout.viewportX, listLayout.viewportY, listLayout.viewportWidth, listLayout.viewportHeight, 16);
+        c.clip();
+
+        if (this.playerList.length === 0) {
+            drawScreenText(
+                'No players connected yet',
+                listLayout.viewportX + listLayout.viewportWidth / 2,
+                listLayout.viewportY + listLayout.viewportHeight / 2,
+                18 * s,
+                '#AAA',
+                'center',
+                'middle',
+                'Arial',
+                true
+            );
+        }
+
         this.playerList.forEach((p, i) => {
-            const y = listY + i * 65 * s;
+            const y = listLayout.viewportY + i * listLayout.rowStep - this.playerListScroll;
+            if (y + listLayout.rowHeight < listLayout.viewportY || y > listLayout.viewportY + listLayout.viewportHeight) {
+                return;
+            }
+
             const playerColor = CONFIG.UI.PLAYER_COLORS[i % CONFIG.UI.PLAYER_COLORS.length];
+            drawRoundRect(
+                listLayout.viewportX + 8 * s,
+                y,
+                listLayout.viewportWidth - 16 * s,
+                listLayout.rowHeight,
+                12,
+                'rgba(0,0,0,0.2)'
+            );
+            drawRoundRect(listLayout.viewportX + 20 * s, y + 17 * s, 20 * s, 20 * s, 10, playerColor);
 
-            // Player slot background
-            drawRoundRect(rightX + 24 * s, y, cardWidth - 48 * s, 54 * s, 12, 'rgba(0,0,0,0.2)');
-
-            // Color indicator
-            drawRoundRect(rightX + 36 * s, y + 17 * s, 20 * s, 20 * s, 10, playerColor);
-
-            // Name & Status
-            const label = `${p.id} ${p.isLocal ? '(You)' : ''} ${p.isHost ? '👑' : ''}`;
-            drawScreenText(label, rightX + 70 * s, y + 27 * s, 18 * s, '#FFF', 'left', 'middle', 'Arial', true);
+            const label = `${p.id}${p.isLocal ? ' (You)' : ''}${p.isHost ? '  Host' : ''}`;
+            drawScreenText(label, listLayout.viewportX + 54 * s, y + 21 * s, 16 * s, '#FFF', 'left', 'middle', 'Arial', true);
+            drawScreenText(`Ship: ${p.ship}`, listLayout.viewportX + 54 * s, y + 38 * s, 12 * s, '#B8C3D1', 'left', 'middle', 'Arial', false);
 
             const stateColor = p.state === 'Ready'
                 ? hexCss(CONFIG.UI.COLORS.SUCCESS)
                 : p.state === 'Connected'
                     ? '#CCC'
                     : '#AAA';
-            drawScreenText(p.state, rightX + cardWidth - 40 * s, y + 27 * s, 14 * s, stateColor, 'right', 'middle', 'Arial', true);
+            drawScreenText(
+                p.state,
+                listLayout.viewportX + listLayout.viewportWidth - 16 * s,
+                y + listLayout.rowHeight / 2,
+                13 * s,
+                stateColor,
+                'right',
+                'middle',
+                'Arial',
+                true
+            );
         });
+        c.restore();
+
+        if (listLayout.maxScroll > 0) {
+            const scrollBtnSize = 26 * s;
+            const scrollX = listLayout.scrollColumnX;
+            const upBtnY = listLayout.viewportY;
+            const downBtnY = listLayout.viewportY + listLayout.viewportHeight - scrollBtnSize;
+            const trackY = upBtnY + scrollBtnSize + 8 * s;
+            const trackHeight = Math.max(24 * s, listLayout.viewportHeight - scrollBtnSize * 2 - 16 * s);
+            const thumbHeight = Math.max(32 * s, trackHeight * (listLayout.viewportHeight / listLayout.contentHeight));
+            const thumbTravel = Math.max(0, trackHeight - thumbHeight);
+            const thumbY = trackY + (listLayout.maxScroll > 0 ? (this.playerListScroll / listLayout.maxScroll) * thumbTravel : 0);
+
+            draw3DButton(
+                scrollX,
+                upBtnY,
+                listLayout.scrollColumnWidth,
+                scrollBtnSize,
+                '▲',
+                CONFIG.UI.COLORS.PRIMARY,
+                false,
+                this._hovered?.id === 'players_scroll_up'
+            );
+            regBtn(scrollX, upBtnY, listLayout.scrollColumnWidth, scrollBtnSize, 'players_scroll_up', () => {
+                this.scrollPlayerListBy(-listLayout.rowStep);
+            });
+
+            draw3DButton(
+                scrollX,
+                downBtnY,
+                listLayout.scrollColumnWidth,
+                scrollBtnSize,
+                '▼',
+                CONFIG.UI.COLORS.PRIMARY,
+                false,
+                this._hovered?.id === 'players_scroll_down'
+            );
+            regBtn(scrollX, downBtnY, listLayout.scrollColumnWidth, scrollBtnSize, 'players_scroll_down', () => {
+                this.scrollPlayerListBy(listLayout.rowStep);
+            });
+
+            drawRoundRect(
+                scrollX + (listLayout.scrollColumnWidth - 10 * s) / 2,
+                trackY,
+                10 * s,
+                trackHeight,
+                5 * s,
+                'rgba(255,255,255,0.12)'
+            );
+            drawRoundRect(
+                scrollX + (listLayout.scrollColumnWidth - 10 * s) / 2,
+                thumbY,
+                10 * s,
+                thumbHeight,
+                5 * s,
+                hexCss(CONFIG.UI.COLORS.SUCCESS, 0.9)
+            );
+        }
 
         // --- Action Area (Bottom Center) ---
         const btnW = 240 * s;
@@ -672,7 +854,7 @@ export class LobbyScene {
                             const botNames = ['Bot1', 'Bot2', 'Bot3'];
                             for (let i = 0; i < numBots; i++) {
                                 const botId = botNames[i] || `Bot${i + 1}`;
-                                const nextSlot = this.worldState.players.size;
+                                const nextSlot = this.worldState.getNextAvailableSlot();
                                 this.worldState.addBot(botId, nextSlot, this.ships[Math.floor(Math.random() * this.ships.length)].id);
                             }
                         }

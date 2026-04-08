@@ -2,7 +2,7 @@
  * config.js — Game configuration for Sky Armada.
  */
 
-window.VERSION = '1.2';
+window.VERSION = '1.3';
 
 export const CONFIG = {
     // ── Identity ────────────────────────────────────────────────────────────
@@ -178,6 +178,7 @@ export const CONFIG = {
 
     NETCODE: {
         TICK_RATE: 60,
+        MAX_PLAYERS: 65535,
         SNAPSHOT_HISTORY: 120,
         MAX_SPECULATION_TICKS: 60,
         HASH_INTERVAL: 60,
@@ -189,6 +190,7 @@ export const CONFIG = {
         ADAPTIVE_INPUT_DELAY: true,
         ADAPTIVE_DELAY_UPDATE_INTERVAL: 30,
         JITTER_BUFFER_MS: 8,
+        STARTUP_INPUT_HISTORY_TICKS: 64,
         MAX_CATCH_UP_TICKS_PER_FRAME: 12,
     },
 

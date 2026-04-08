@@ -969,13 +969,29 @@ export class WorldState {
         this.localPlayerId = id;
     }
 
+    getNextAvailableSlot() {
+        const usedSlots = new Set();
+        for (const player of this.players.values()) {
+            usedSlots.add(player.slot);
+        }
+
+        let slot = 0;
+        while (usedSlots.has(slot)) {
+            slot++;
+        }
+        return slot;
+    }
+
     addPlayer(id, slotIndex) {
+        const resolvedSlot = Number.isInteger(slotIndex) && slotIndex >= 0 && !this.getPlayerBySlot(slotIndex)
+            ? slotIndex
+            : this.getNextAvailableSlot();
         const { xMin, xMax, yMin, yMax } = this.getSpawnBounds();
         const x = xMin + this.rand() * (xMax - xMin);
         const y = yMin + this.rand() * (yMax - yMin);
         const heading = (x < this.arena.width / 2) ? 0 : 180;
 
-        this.players.set(id, this.createPlayerState(slotIndex, {
+        this.players.set(id, this.createPlayerState(resolvedSlot, {
             shipId: 'cobro',
             x,
             y,

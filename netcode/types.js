@@ -1,5 +1,5 @@
 export const TICK_MIN = -1;
-export const MAX_PLAYERS_LIMIT = 16;
+export const MAX_PLAYERS_LIMIT = 65535;
 
 export const Topology = { Mesh: 0, Star: 1 };
 export const DesyncAuthority = { Host: 0, Peer: 1 };
@@ -11,7 +11,7 @@ export const PauseReason = { PlayerRequest: 0, PlayerDisconnect: 1, ExcessiveLag
 
 export const DEFAULT_SESSION_CONFIG = {
     tickRate: 60,
-    maxPlayers: 4,
+    maxPlayers: MAX_PLAYERS_LIMIT,
     topology: Topology.Star,
     snapshotHistorySize: 120,
     maxSpeculationTicks: 60,
@@ -29,6 +29,7 @@ export const DEFAULT_SESSION_CONFIG = {
     jitterBufferMs: 8,
     joinRateLimitRequests: 3,
     joinRateLimitWindowMs: 10000,
+    startupInputHistoryTicks: 64,
 };
 
 export function asTick(n) {
@@ -91,6 +92,9 @@ export function validateSessionConfig(config) {
     }
     if (!Number.isFinite(config.jitterBufferMs) || config.jitterBufferMs < 0) {
         throw new ValidationError('jitterBufferMs must be >= 0', 'jitterBufferMs', config.jitterBufferMs);
+    }
+    if (!Number.isInteger(config.startupInputHistoryTicks) || config.startupInputHistoryTicks < 1) {
+        throw new ValidationError('startupInputHistoryTicks must be a positive integer', 'startupInputHistoryTicks', config.startupInputHistoryTicks);
     }
 }
 

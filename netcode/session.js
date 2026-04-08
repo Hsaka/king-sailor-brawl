@@ -254,6 +254,7 @@ export class Session {
             jitterBufferMs: this.config.jitterBufferMs,
             joinRateLimitRequests: this.config.joinRateLimitRequests,
             joinRateLimitWindowMs: this.config.joinRateLimitWindowMs,
+            startupInputHistoryTicks: this.config.startupInputHistoryTicks,
         };
     }
 
@@ -279,6 +280,7 @@ export class Session {
             'jitterBufferMs',
             'joinRateLimitRequests',
             'joinRateLimitWindowMs',
+            'startupInputHistoryTicks',
         ];
 
         const sanitized = {};
@@ -1191,15 +1193,22 @@ export class Session {
     }
 
     broadcastInput(tick, input) {
-        const inputs = [{ tick, input }];
+        const inputs = [];
+        const startupHistoryTicks = Math.max(1, this.config.startupInputHistoryTicks ?? 64);
+        const resendWindow = tick < startupHistoryTicks
+            ? tick + 1
+            : this.inputRedundancy;
 
-        for (let i = 1; i < this.inputRedundancy; i++) {
-            const prevTick = asTick(tick - i);
-            if (prevTick >= 0) {
-                const prevInput = this.engine.getLocalInput(prevTick);
-                if (prevInput) {
-                    inputs.push({ tick: prevTick, input: prevInput });
-                }
+        for (let i = 0; i < resendWindow; i++) {
+            const resendTick = asTick(tick - i);
+            if (resendTick < 0) break;
+
+            const resendInput = resendTick === tick
+                ? input
+                : this.engine.getLocalInput(resendTick);
+
+            if (resendInput) {
+                inputs.push({ tick: resendTick, input: resendInput });
             }
         }
 
